@@ -3,8 +3,11 @@
 This module provides experiment setup, training, evaluation, and diagnostics.
 Fault-injection logic is delegated to faults.py module.
 """
-
 from __future__ import annotations
+
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
+
 
 import argparse
 import json
@@ -18,6 +21,7 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 import faults
+import baseline_debugging
 
 
 # ---------------------
@@ -373,7 +377,7 @@ def apply_fault_injection(
 
 
 def main() -> Dict[str, Any]:
-    """Run the full reproducible training and fault-injection workflow."""
+    """Run the full reproducible training and fault-injection workflow with baseline debugging."""
     features, labels = load_dataset()
     splits = split_dataset(features, labels)
     injected_splits, fault_metadata = apply_fault_injection(splits)
@@ -392,14 +396,17 @@ def main() -> Dict[str, Any]:
         injected_splits["clean_holdout"]["labels"],
     )
 
+    print(f"\n{'='*70}")
+    print("FAULT INJECTION & INITIAL TRAINING")
+    print(f"{'='*70}")
     print(f"Active fault type: {FAULT_TYPE}")
-    print("Fault metadata:")
+    print("\nFault metadata:")
     print(json.dumps(fault_metadata, indent=2, ensure_ascii=False))
-    _print_metric_block("Train metrics:", train_metrics)
+    _print_metric_block("\nTrain metrics:", train_metrics)
     _print_metric_block("Contaminated eval metrics:", contaminated_eval_metrics)
     _print_metric_block("Clean holdout metrics:", clean_holdout_metrics)
 
-    print("Gap summary:")
+    print("\nAccuracy gap summary:")
     print(f"  train -> contaminated_eval: {train_metrics['accuracy'] - contaminated_eval_metrics['accuracy']:.4f}")
     print(f"  train -> clean_holdout: {train_metrics['accuracy'] - clean_holdout_metrics['accuracy']:.4f}")
     print(f"  contaminated_eval -> clean_holdout: {contaminated_eval_metrics['accuracy'] - clean_holdout_metrics['accuracy']:.4f}")
@@ -414,12 +421,75 @@ def main() -> Dict[str, Any]:
             injected_splits,
         )
 
+    # Build config dict for baseline debugging
+    baseline_config = {
+        "RANDOM_STATE": RANDOM_STATE,
+        "N_ESTIMATORS": N_ESTIMATORS,
+    }
+
+    # Run baseline debugging
+    print(f"\n{'='*70}")
+    print("BASELINE DEBUGGING (NO XAI)")
+    print(f"{'='*70}")
+    baseline_result = baseline_debugging.run_baseline_debugging(
+        model=model,
+        fault_type=FAULT_TYPE,
+        fault_metadata=fault_metadata,
+        injected_splits=injected_splits,
+        config=baseline_config,
+    )
+
+    # Format baseline results
+    print(f"\nDetection steps: {baseline_result['steps_to_detect']}")
+    print(f"Retrains: {baseline_result['retrains']}")
+    print(f"Runtime: {baseline_result['runtime_sec']:.3f} seconds")
+
+    if FAULT_TYPE == "label_noise":
+        print(f"\nLabel Noise Detection:")
+        print(f"  Precision@k: {baseline_result.get('precision_at_k', 0.0):.4f}")
+        print(f"  Recall@k: {baseline_result.get('recall_at_k', 0.0):.4f}")
+        print(f"  Top suspect indices: {baseline_result.get('suspect_indices', [])[:5]}")
+
+    elif FAULT_TYPE == "data_leakage":
+        print(f"\nData Leakage Detection:")
+        print(f"  Rank of true feature: {baseline_result.get('rank_true_feature', -1)}")
+        print(f"  Top candidate feature: {baseline_result.get('top_candidate_feature')}")
+        print(f"  Top-5 suspect features: {baseline_result.get('suspect_features', [])[:5]}")
+
+    elif FAULT_TYPE == "spurious_correlation":
+        print(f"\nSpurious Correlation Detection:")
+        print(f"  Rank of true feature: {baseline_result.get('rank_true_feature', -1)}")
+        print(f"  Top candidate feature: {baseline_result.get('top_candidate_feature')}")
+        print(f"  Top-5 suspect features: {baseline_result.get('suspect_features', [])[:5]}")
+
+    print(f"\nMetrics before fix:")
+    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
+        acc = baseline_result["metrics_before"].get(f"{split_name}_accuracy", 0.0)
+        f1 = baseline_result["metrics_before"].get(f"{split_name}_f1", 0.0)
+        auc = baseline_result["metrics_before"].get(f"{split_name}_roc_auc", 0.0)
+        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
+
+    print(f"\nMetrics after fix:")
+    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
+        acc = baseline_result["metrics_after"].get(f"{split_name}_accuracy", 0.0)
+        f1 = baseline_result["metrics_after"].get(f"{split_name}_f1", 0.0)
+        auc = baseline_result["metrics_after"].get(f"{split_name}_roc_auc", 0.0)
+        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
+
+    print(f"\nFix impact (delta):")
+    for metric_name, delta in baseline_result["fix_impact"].items():
+        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+        print(f"  {metric_name}: {delta:+.4f} {direction}")
+
     return {
         "fault_type": FAULT_TYPE,
         "fault_metadata": fault_metadata,
-        "train_metrics": train_metrics,
-        "contaminated_eval_metrics": contaminated_eval_metrics,
-        "clean_holdout_metrics": clean_holdout_metrics,
+        "initial_metrics": {
+            "train": train_metrics,
+            "contaminated_eval": contaminated_eval_metrics,
+            "clean_holdout": clean_holdout_metrics,
+        },
+        "baseline_debugging_result": baseline_result,
     }
 
 
