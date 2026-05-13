@@ -3,6 +3,7 @@
 This module provides experiment setup, training, evaluation, and diagnostics.
 Fault-injection logic is delegated to faults.py module.
 """
+
 from __future__ import annotations
 
 import sys
@@ -22,6 +23,7 @@ from sklearn.model_selection import train_test_split
 
 import faults
 import baseline_debugging
+import xai_debugging
 
 
 # ---------------------
@@ -44,19 +46,42 @@ PROBE_N_ESTIMATORS = 30
 # Data leakage config
 LEAKAGE_MODE = "indirect"  # options: "direct", "indirect"
 LEAKAGE_STRENGTH = 0.80
-INDIRECT_LEAKAGE_BINS = 8
+INDIRECT_LEAKAGE_BINS = 10
 INDIRECT_LEAKAGE_CONTAM_SMOOTHING = 0.75
 INDIRECT_LEAKAGE_CLEAN_SMOOTHING = 18.0
-INDIRECT_LEAKAGE_HOLDOUT_SHRINK = 0.95
-INDIRECT_LEAKAGE_NOISE_STD = 0.06
+INDIRECT_LEAKAGE_HOLDOUT_SHRINK = 0.96
+INDIRECT_LEAKAGE_NOISE_STD = 0.05
+
+# Subgroup-local indirect leakage
+INDIRECT_LEAKAGE_ACTIVE_GROUPS = 1
+INDIRECT_LEAKAGE_HOLDOUT_GROUP_SHIFT = 1
+INDIRECT_LEAKAGE_OFFGROUP_SHRINK = 0.92
+INDIRECT_LEAKAGE_OFFGROUP_NOISE_STD = 0.10
+INDIRECT_LEAKAGE_HOLDOUT_ACTIVE_SCALE = 0.20
 
 # Spurious correlation config
 SPURIOUS_MODE = "broken"  # options: "broken", "inverted"
 SPURIOUS_STRENGTH = 0.90
 USE_GROUPS_FOR_SPURIOUS = True
-INVERTED_GROUP_WEIGHT = 0.35
-INVERTED_SIGNAL_WEIGHT = 0.20
-INVERTED_NOISE_STD = 0.42
+
+# Subgroup-local spurious shortcut
+SPURIOUS_ACTIVE_GROUPS = 1
+SPURIOUS_HOLDOUT_GROUP_SHIFT = 1
+SPURIOUS_OFFGROUP_SIGNAL_WEIGHT = 0.03
+SPURIOUS_OFFGROUP_NOISE_STD = 0.45
+
+BROKEN_ACTIVE_SCALE = 0.08
+BROKEN_NOISE_STD = 0.38
+
+INVERTED_GROUP_WEIGHT = 0.15
+INVERTED_SIGNAL_WEIGHT = 0.16
+INVERTED_NOISE_STD = 0.40
+
+# XAI config
+SHAP_BACKGROUND_SIZE = 120
+LABEL_NOISE_CV_FOLDS = 5
+XAI_LABEL_BASELINE_WEIGHT = 0.65
+XAI_LABEL_PROFILE_WEIGHT = 0.35
 
 # Sanity checks
 ENABLE_FAULT_SANITY_CHECKS = True
@@ -158,13 +183,13 @@ def _quality_leakage(
             return "too_trivial", "Direct leakage is nearly a label copy; too obvious for debugging."
         return "too_trivial", "Direct leakage is too straightforward to be interesting for multi-method comparison."
 
-    if contaminated_corr < 0.30 or eval_gain < 0.020:
+    if contaminated_corr < 0.15 or eval_gain < 0.010:
         return "too_weak", "Indirect leakage signal is too weak to separate offline and clean views."
-    if contaminated_corr > 0.92 or eval_gain > 0.14:
+    if contaminated_corr > 0.88 or eval_gain > 0.12:
         return "too_strong", "Indirect leakage is too dominant; leaves little room for debugging insights."
-    if corr_drop < 0.15:
+    if corr_drop < 0.08:
         return "too_weak", "Indirect leakage behaves too similarly on contaminated_eval and clean_holdout."
-    return "usable", "Indirect leakage creates a clear offline/clean gap without being trivial."
+    return "usable", "Indirect leakage creates a meaningful offline/clean gap without being globally obvious."
 
 
 def _quality_spurious(
@@ -182,24 +207,24 @@ def _quality_spurious(
     holdout_gap = train_metrics["accuracy"] - clean_holdout_metrics["accuracy"]
     holdout_negative_corr = clean_stats["correlation"]
 
-    if train_corr < 0.35 or contaminated_corr < 0.35:
-        return "too_weak", "Shortcut feature is not attractive enough in the training view."
+    if train_corr < 0.15 or contaminated_corr < 0.15:
+        return "too_weak", "Shortcut feature is not attractive enough in the offline world."
 
     if spurious_mode == "broken":
-        if holdout_corr > 0.15:
-            return "too_weak", "Holdout shortcut is not truly broken; residual correlation remains."
-        if holdout_gap < 0.08:
-            return "too_weak", "Distribution shift from shortcut breaking is too subtle."
-        return "usable", "Shortcut breaks cleanly in holdout; domain shift is realistic."
+        if holdout_corr > 0.12:
+            return "too_weak", "Holdout shortcut is not broken enough; residual correlation remains."
+        if holdout_gap < 0.04:
+            return "too_weak", "The subgroup shortcut does not hurt holdout enough."
+        return "usable", "Shortcut is subgroup-local offline and breaks meaningfully on holdout."
 
     if spurious_mode == "inverted":
-        if holdout_negative_corr > -0.15:
+        if holdout_negative_corr > -0.08:
             return "too_weak", "Inversion in holdout is too weak."
-        if holdout_gap > 0.30 or clean_holdout_metrics["accuracy"] < 0.68:
+        if holdout_gap > 0.24 or clean_holdout_metrics["accuracy"] < 0.70:
             return "too_strong", "Inversion effect is still too brutal; holdout fails too badly."
-        return "usable", "Inversion is clear but not catastrophic; realistic debugging scenario."
+        return "usable", "Inversion is visible but still realistic for debugging."
 
-    return "usable", "Spurious correlation shows realistic train/holdout shift."
+    return "usable", "Spurious correlation shows a realistic train/holdout shift."
 
 
 def assess_fault_quality(
@@ -316,7 +341,6 @@ def apply_fault_injection(
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
 ) -> Tuple[Dict[str, Dict[str, pd.DataFrame | pd.Series]], Dict[str, Any]]:
     """Apply fault injection using faults module with config dictionary."""
-    # Build config dict from global variables for faults module
     config = {
         "RANDOM_STATE": RANDOM_STATE,
         "LABEL_NOISE_RATE": LABEL_NOISE_RATE,
@@ -329,9 +353,20 @@ def apply_fault_injection(
         "INDIRECT_LEAKAGE_CLEAN_SMOOTHING": INDIRECT_LEAKAGE_CLEAN_SMOOTHING,
         "INDIRECT_LEAKAGE_HOLDOUT_SHRINK": INDIRECT_LEAKAGE_HOLDOUT_SHRINK,
         "INDIRECT_LEAKAGE_NOISE_STD": INDIRECT_LEAKAGE_NOISE_STD,
+        "INDIRECT_LEAKAGE_ACTIVE_GROUPS": INDIRECT_LEAKAGE_ACTIVE_GROUPS,
+        "INDIRECT_LEAKAGE_HOLDOUT_GROUP_SHIFT": INDIRECT_LEAKAGE_HOLDOUT_GROUP_SHIFT,
+        "INDIRECT_LEAKAGE_OFFGROUP_SHRINK": INDIRECT_LEAKAGE_OFFGROUP_SHRINK,
+        "INDIRECT_LEAKAGE_OFFGROUP_NOISE_STD": INDIRECT_LEAKAGE_OFFGROUP_NOISE_STD,
+        "INDIRECT_LEAKAGE_HOLDOUT_ACTIVE_SCALE": INDIRECT_LEAKAGE_HOLDOUT_ACTIVE_SCALE,
         "SPURIOUS_MODE": SPURIOUS_MODE,
         "SPURIOUS_STRENGTH": SPURIOUS_STRENGTH,
         "USE_GROUPS_FOR_SPURIOUS": USE_GROUPS_FOR_SPURIOUS,
+        "SPURIOUS_ACTIVE_GROUPS": SPURIOUS_ACTIVE_GROUPS,
+        "SPURIOUS_HOLDOUT_GROUP_SHIFT": SPURIOUS_HOLDOUT_GROUP_SHIFT,
+        "SPURIOUS_OFFGROUP_SIGNAL_WEIGHT": SPURIOUS_OFFGROUP_SIGNAL_WEIGHT,
+        "SPURIOUS_OFFGROUP_NOISE_STD": SPURIOUS_OFFGROUP_NOISE_STD,
+        "BROKEN_ACTIVE_SCALE": BROKEN_ACTIVE_SCALE,
+        "BROKEN_NOISE_STD": BROKEN_NOISE_STD,
         "INVERTED_GROUP_WEIGHT": INVERTED_GROUP_WEIGHT,
         "INVERTED_SIGNAL_WEIGHT": INVERTED_SIGNAL_WEIGHT,
         "INVERTED_NOISE_STD": INVERTED_NOISE_STD,
@@ -376,8 +411,55 @@ def apply_fault_injection(
     return splits, metadata
 
 
+def _print_debugging_result(title: str, result: Dict[str, Any], fault_type: str) -> None:
+    print(f"\n{'*'*70}")
+    print(title)
+    print(f"{'*'*70}")
+
+    print(f"\nDetection steps: {result['steps_to_detect']}")
+    print(f"Retrains: {result['retrains']}")
+    print(f"Runtime: {result['runtime_sec']:.3f} seconds")
+
+    if fault_type == "label_noise":
+        print(f"\nLabel Noise Detection:")
+        print(f"  Precision@k: {result.get('precision_at_k', 0.0):.4f}")
+        print(f"  Recall@k: {result.get('recall_at_k', 0.0):.4f}")
+        print(f"  Top suspect indices: {result.get('suspect_indices', [])[:5]}")
+
+    elif fault_type == "data_leakage":
+        print(f"\nData Leakage Detection:")
+        print(f"  Rank of true feature: {result.get('rank_true_feature', -1)}")
+        print(f"  Top candidate feature: {result.get('top_candidate_feature')}")
+        print(f"  Top-5 suspect features: {result.get('suspect_features', [])[:5]}")
+
+    elif fault_type == "spurious_correlation":
+        print(f"\nSpurious Correlation Detection:")
+        print(f"  Rank of true feature: {result.get('rank_true_feature', -1)}")
+        print(f"  Top candidate feature: {result.get('top_candidate_feature')}")
+        print(f"  Top-5 suspect features: {result.get('suspect_features', [])[:5]}")
+
+    print(f"\nMetrics before fix:")
+    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
+        acc = result["metrics_before"].get(f"{split_name}_accuracy", 0.0)
+        f1 = result["metrics_before"].get(f"{split_name}_f1", 0.0)
+        auc = result["metrics_before"].get(f"{split_name}_roc_auc", 0.0)
+        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
+
+    print(f"\nMetrics after fix:")
+    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
+        acc = result["metrics_after"].get(f"{split_name}_accuracy", 0.0)
+        f1 = result["metrics_after"].get(f"{split_name}_f1", 0.0)
+        auc = result["metrics_after"].get(f"{split_name}_roc_auc", 0.0)
+        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
+
+    print(f"\nFix impact (delta):")
+    for metric_name, delta in result["fix_impact"].items():
+        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+        print(f"  {metric_name}: {delta:+.4f} {direction}")
+
+
 def main() -> Dict[str, Any]:
-    """Run the full reproducible training and fault-injection workflow with baseline debugging."""
+    """Run the full reproducible training and fault-injection workflow with baseline + XAI debugging."""
     features, labels = load_dataset()
     splits = split_dataset(features, labels)
     injected_splits, fault_metadata = apply_fault_injection(splits)
@@ -421,16 +503,21 @@ def main() -> Dict[str, Any]:
             injected_splits,
         )
 
-    # Build config dict for baseline debugging
     baseline_config = {
         "RANDOM_STATE": RANDOM_STATE,
         "N_ESTIMATORS": N_ESTIMATORS,
+        "LABEL_NOISE_CV_FOLDS": LABEL_NOISE_CV_FOLDS,
     }
 
-    # Run baseline debugging
-    print(f"\n{'*'*70}")
-    print("BASELINE DEBUGGING (NO XAI)")
-    print(f"{'*'*70}")
+    xai_config = {
+        "RANDOM_STATE": RANDOM_STATE,
+        "N_ESTIMATORS": N_ESTIMATORS,
+        "LABEL_NOISE_CV_FOLDS": LABEL_NOISE_CV_FOLDS,
+        "SHAP_BACKGROUND_SIZE": SHAP_BACKGROUND_SIZE,
+        "XAI_LABEL_BASELINE_WEIGHT": XAI_LABEL_BASELINE_WEIGHT,
+        "XAI_LABEL_PROFILE_WEIGHT": XAI_LABEL_PROFILE_WEIGHT,
+    }
+
     baseline_result = baseline_debugging.run_baseline_debugging(
         model=model,
         fault_type=FAULT_TYPE,
@@ -438,48 +525,16 @@ def main() -> Dict[str, Any]:
         injected_splits=injected_splits,
         config=baseline_config,
     )
+    _print_debugging_result("BASELINE DEBUGGING (NO XAI)", baseline_result, FAULT_TYPE)
 
-    # Format baseline results
-    print(f"\nDetection steps: {baseline_result['steps_to_detect']}")
-    print(f"Retrains: {baseline_result['retrains']}")
-    print(f"Runtime: {baseline_result['runtime_sec']:.3f} seconds")
-
-    if FAULT_TYPE == "label_noise":
-        print(f"\nLabel Noise Detection:")
-        print(f"  Precision@k: {baseline_result.get('precision_at_k', 0.0):.4f}")
-        print(f"  Recall@k: {baseline_result.get('recall_at_k', 0.0):.4f}")
-        print(f"  Top suspect indices: {baseline_result.get('suspect_indices', [])[:5]}")
-
-    elif FAULT_TYPE == "data_leakage":
-        print(f"\nData Leakage Detection:")
-        print(f"  Rank of true feature: {baseline_result.get('rank_true_feature', -1)}")
-        print(f"  Top candidate feature: {baseline_result.get('top_candidate_feature')}")
-        print(f"  Top-5 suspect features: {baseline_result.get('suspect_features', [])[:5]}")
-
-    elif FAULT_TYPE == "spurious_correlation":
-        print(f"\nSpurious Correlation Detection:")
-        print(f"  Rank of true feature: {baseline_result.get('rank_true_feature', -1)}")
-        print(f"  Top candidate feature: {baseline_result.get('top_candidate_feature')}")
-        print(f"  Top-5 suspect features: {baseline_result.get('suspect_features', [])[:5]}")
-
-    print(f"\nMetrics before fix:")
-    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
-        acc = baseline_result["metrics_before"].get(f"{split_name}_accuracy", 0.0)
-        f1 = baseline_result["metrics_before"].get(f"{split_name}_f1", 0.0)
-        auc = baseline_result["metrics_before"].get(f"{split_name}_roc_auc", 0.0)
-        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
-
-    print(f"\nMetrics after fix:")
-    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
-        acc = baseline_result["metrics_after"].get(f"{split_name}_accuracy", 0.0)
-        f1 = baseline_result["metrics_after"].get(f"{split_name}_f1", 0.0)
-        auc = baseline_result["metrics_after"].get(f"{split_name}_roc_auc", 0.0)
-        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
-
-    print(f"\nFix impact (delta):")
-    for metric_name, delta in baseline_result["fix_impact"].items():
-        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
-        print(f"  {metric_name}: {delta:+.4f} {direction}")
+    xai_result = xai_debugging.run_xai_debugging(
+        model=model,
+        fault_type=FAULT_TYPE,
+        fault_metadata=fault_metadata,
+        injected_splits=injected_splits,
+        config=xai_config,
+    )
+    _print_debugging_result("XAI DEBUGGING (SHAP)", xai_result, FAULT_TYPE)
 
     return {
         "fault_type": FAULT_TYPE,
@@ -490,6 +545,7 @@ def main() -> Dict[str, Any]:
             "clean_holdout": clean_holdout_metrics,
         },
         "baseline_debugging_result": baseline_result,
+        "xai_debugging_result": xai_result,
     }
 
 

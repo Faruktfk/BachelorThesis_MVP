@@ -113,19 +113,20 @@ def _select_indirect_leakage_features(
     labels: pd.Series,
     n_features: int = 3
 ) -> list[str]:
-    """Choose medium-correlation features so indirect leakage is not just a relabeled strong feature."""
+    """Choose lower-to-medium correlation features so leakage is not just a relabeled top predictor."""
     numeric = frame.select_dtypes(include=[np.number])
     corr_scores = numeric.apply(lambda col: abs(_safe_corr(col, labels)), axis=0)
     var_scores = numeric.var(axis=0)
 
-    low_q = float(corr_scores.quantile(0.25))
-    high_q = float(corr_scores.quantile(0.65))
+    low_q = float(corr_scores.quantile(0.15))
+    high_q = float(corr_scores.quantile(0.55))
     candidate_mask = (corr_scores >= low_q) & (corr_scores <= high_q)
     candidates = corr_scores.index[candidate_mask].tolist()
+
     if len(candidates) < n_features:
         median_corr = float(corr_scores.median())
         ordered = sorted(corr_scores.index.tolist(), key=lambda f: abs(corr_scores[f] - median_corr))
-        candidates = ordered[: max(n_features, 5)]
+        candidates = ordered[: max(n_features, 6)]
 
     ranked = sorted(candidates, key=lambda f: (-var_scores[f], corr_scores[f]))
     chosen = ranked[:n_features]
@@ -133,6 +134,50 @@ def _select_indirect_leakage_features(
         fallback = [c for c in numeric.columns if c not in chosen]
         chosen.extend(fallback[: n_features - len(chosen)])
     return chosen[:n_features]
+
+
+def _choose_subgroup_feature(
+    frame: pd.DataFrame,
+    labels: pd.Series,
+    excluded: list[str] | None = None,
+) -> str:
+    """Pick a medium-correlation numeric feature for subgroup activation."""
+    if excluded is None:
+        excluded = []
+
+    numeric = frame.select_dtypes(include=[np.number])
+    candidates = [c for c in numeric.columns if c not in excluded]
+    if not candidates:
+        return numeric.columns[0]
+
+    corr_scores = pd.Series(
+        {col: abs(_safe_corr(numeric[col], labels)) for col in candidates}
+    )
+    var_scores = numeric[candidates].var(axis=0)
+
+    median_corr = float(corr_scores.median())
+    ranked = sorted(
+        candidates,
+        key=lambda c: (abs(corr_scores[c] - median_corr), -var_scores[c]),
+    )
+    return ranked[0]
+
+
+def _pick_centered_groups(unique_groups: list[int], n_active: int) -> set[int]:
+    """Choose centered subgroup ids so the injected effect is local, not global."""
+    if not unique_groups:
+        return set()
+    if n_active >= len(unique_groups):
+        return set(unique_groups)
+
+    center = len(unique_groups) // 2
+    start = max(0, center - (n_active // 2))
+    end = start + n_active
+    if end > len(unique_groups):
+        end = len(unique_groups)
+        start = max(0, end - n_active)
+
+    return set(unique_groups[start:end])
 
 
 def _build_multi_feature_keys(frame: pd.DataFrame, feature_names: list[str], edges_map: Dict[str, np.ndarray]) -> pd.Series:
@@ -154,22 +199,25 @@ def _build_indirect_leakage_signal(
     contaminated_eval_labels: pd.Series,
     config: Dict[str, Any],
 ) -> Tuple[pd.Series, pd.Series, pd.Series, Dict[str, Any]]:
-    """Create a stronger but still non-trivial indirect leakage signal.
+    """Create a subtler indirect leakage signal.
 
-    Strategy:
-    - choose medium-correlation raw features instead of the strongest label correlates
-    - build a higher-cardinality multi-feature bucket key
-    - encode the target on train+contaminated_eval (leaky offline world)
-    - encode the clean holdout only with train statistics, heavy smoothing and shrinkage
+    Key idea:
+    - the signal is still a single feature column for compatibility with the current pipeline
+    - but it is only strongly informative in a small subgroup
+    - outside that subgroup it is heavily shrunk toward the global mean
+    - in clean holdout the active subgroup is shifted and the signal is weakened further
 
-    This makes contaminated_eval optimistic while keeping clean_holdout notably weaker,
-    without degenerating into a direct label copy.
+    This makes the feature much less obvious to global baseline statistics while keeping
+    a real fault effect for local / subgroup-sensitive methods later.
     """
     rng = np.random.default_rng(config["RANDOM_STATE"])
+
     contaminated_source = pd.concat([train_features, contaminated_eval_features], axis=0)
     contaminated_labels = pd.concat([train_labels, contaminated_eval_labels], axis=0)
 
     feature_names = _select_indirect_leakage_features(contaminated_source, contaminated_labels, n_features=3)
+    subgroup_feature = _choose_subgroup_feature(contaminated_source, contaminated_labels, excluded=feature_names)
+
     edges_map = {
         feature_name: _quantile_edges(contaminated_source[feature_name], bins=config["INDIRECT_LEAKAGE_BINS"])
         for feature_name in feature_names
@@ -190,39 +238,79 @@ def _build_indirect_leakage_signal(
         smoothing=config["INDIRECT_LEAKAGE_CLEAN_SMOOTHING"],
     )
 
-    contaminated_signal = _apply_lookup(contaminated_keys, contaminated_lookup)
-    contaminated_signal = pd.Series(
-        np.clip(
-            contaminated_signal.to_numpy() + rng.normal(0.0, config["INDIRECT_LEAKAGE_NOISE_STD"], size=len(contaminated_signal)),
-            0.0,
-            1.0,
-        ),
-        index=contaminated_signal.index,
+    raw_contaminated_signal = _apply_lookup(contaminated_keys, contaminated_lookup)
+    raw_holdout_signal = _apply_lookup(holdout_keys, clean_lookup)
+    global_mean = float(train_labels.mean())
+
+    subgroup_edges = _quantile_edges(contaminated_source[subgroup_feature], bins=4)
+    contaminated_groups = _bin_series(contaminated_source[subgroup_feature], subgroup_edges)
+    holdout_groups = _bin_series(clean_holdout_features[subgroup_feature], subgroup_edges)
+
+    unique_groups = sorted(pd.Index(contaminated_groups.unique()).tolist())
+    active_groups = _pick_centered_groups(unique_groups, config["INDIRECT_LEAKAGE_ACTIVE_GROUPS"])
+
+    shifted_active_groups = set()
+    if unique_groups:
+        ordered_groups = list(unique_groups)
+        for group in active_groups:
+            base_idx = ordered_groups.index(group)
+            shifted_idx = (base_idx + config["INDIRECT_LEAKAGE_HOLDOUT_GROUP_SHIFT"]) % len(ordered_groups)
+            shifted_active_groups.add(ordered_groups[shifted_idx])
+
+    contaminated_active_mask = contaminated_groups.isin(active_groups).to_numpy()
+    holdout_active_mask = holdout_groups.isin(shifted_active_groups).to_numpy()
+
+    contaminated_values = np.full(len(raw_contaminated_signal), global_mean, dtype=float)
+    raw_contam = raw_contaminated_signal.to_numpy()
+
+    # Strong local leakage only inside the active subgroup.
+    contaminated_values[contaminated_active_mask] = (
+        0.85 * raw_contam[contaminated_active_mask]
+        + 0.15 * global_mean
+        + rng.normal(0.0, config["INDIRECT_LEAKAGE_NOISE_STD"], size=int(contaminated_active_mask.sum()))
     )
 
-    global_mean = float(train_labels.mean())
-    raw_holdout_signal = _apply_lookup(holdout_keys, clean_lookup)
-    holdout_signal = pd.Series(
-        np.clip(
-            (1.0 - config["INDIRECT_LEAKAGE_HOLDOUT_SHRINK"]) * raw_holdout_signal.to_numpy()
-            + config["INDIRECT_LEAKAGE_HOLDOUT_SHRINK"] * global_mean
-            + rng.normal(0.0, config["INDIRECT_LEAKAGE_NOISE_STD"], size=len(raw_holdout_signal)),
-            0.0,
-            1.0,
-        ),
-        index=raw_holdout_signal.index,
+    # Outside the subgroup: mostly harmless / close to global mean.
+    contaminated_values[~contaminated_active_mask] = (
+        config["INDIRECT_LEAKAGE_OFFGROUP_SHRINK"] * global_mean
+        + (1.0 - config["INDIRECT_LEAKAGE_OFFGROUP_SHRINK"]) * raw_contam[~contaminated_active_mask]
+        + rng.normal(0.0, config["INDIRECT_LEAKAGE_OFFGROUP_NOISE_STD"], size=int((~contaminated_active_mask).sum()))
     )
+
+    holdout_values = np.full(len(raw_holdout_signal), global_mean, dtype=float)
+    raw_hold = raw_holdout_signal.to_numpy()
+
+    # Even inside the shifted active subgroup, holdout only gets a much weaker version.
+    holdout_values[holdout_active_mask] = (
+        config["INDIRECT_LEAKAGE_HOLDOUT_ACTIVE_SCALE"] * raw_hold[holdout_active_mask]
+        + (1.0 - config["INDIRECT_LEAKAGE_HOLDOUT_ACTIVE_SCALE"]) * global_mean
+        + rng.normal(0.0, config["INDIRECT_LEAKAGE_OFFGROUP_NOISE_STD"], size=int(holdout_active_mask.sum()))
+    )
+
+    # Outside that subgroup, almost pure background.
+    holdout_values[~holdout_active_mask] = (
+        config["INDIRECT_LEAKAGE_HOLDOUT_SHRINK"] * global_mean
+        + (1.0 - config["INDIRECT_LEAKAGE_HOLDOUT_SHRINK"]) * raw_hold[~holdout_active_mask]
+        + rng.normal(0.0, config["INDIRECT_LEAKAGE_OFFGROUP_NOISE_STD"], size=int((~holdout_active_mask).sum()))
+    )
+
+    contaminated_signal = pd.Series(np.clip(contaminated_values, 0.0, 1.0), index=contaminated_source.index)
+    holdout_signal = pd.Series(np.clip(holdout_values, 0.0, 1.0), index=clean_holdout_features.index)
 
     train_signal = contaminated_signal.loc[train_features.index]
     eval_signal = contaminated_signal.loc[contaminated_eval_features.index]
 
     metadata = {
-        "construction": "high-cardinality multi-feature target encoding with contaminated offline lookup and train-only clean fallback",
+        "construction": "subgroup-local multi-feature target encoding with leaky offline lookup and weakened clean fallback",
         "orig_variables": feature_names,
-        "statistic": "multi_bucket_target_encoding",
+        "subgroup_feature": subgroup_feature,
+        "active_groups_offline": sorted(list(active_groups)),
+        "active_groups_holdout": sorted(list(shifted_active_groups)),
+        "statistic": "localized_multi_bucket_target_encoding",
         "leakage_strength_rationale": (
-            "Contaminated view uses train+offline labels with low smoothing; clean holdout uses train-only encoding "
-            "with heavy shrinkage to the global mean so offline optimism appears without a direct label copy."
+            "The leaky signal is only strong inside a small subgroup in train/offline data. "
+            "Outside that subgroup it is shrunk toward the global mean, and in clean holdout "
+            "the active subgroup is shifted and the signal is weakened further."
         ),
     }
     return train_signal, eval_signal, holdout_signal, metadata
@@ -347,6 +435,9 @@ def _inject_data_leakage(
                 "leakage_feature_name": leakage_feature_name,
                 "construction": construction_meta["construction"],
                 "orig_variables": construction_meta["orig_variables"],
+                "subgroup_feature": construction_meta["subgroup_feature"],
+                "active_groups_offline": construction_meta["active_groups_offline"],
+                "active_groups_holdout": construction_meta["active_groups_holdout"],
                 "statistic": construction_meta["statistic"],
             }
         )
@@ -383,7 +474,15 @@ def _inject_spurious_correlation(
     clean_holdout_split: Dict[str, pd.DataFrame | pd.Series],
     config: Dict[str, Any],
 ) -> Tuple[Dict[str, pd.DataFrame | pd.Series], Dict[str, Any]]:
-    """Inject spurious correlation: broken or inverted shortcut in holdout."""
+    """Inject a subtler spurious correlation.
+
+    Key idea:
+    - the shortcut is strong mainly inside one subgroup in train/offline data
+    - outside that subgroup it is mostly noise
+    - in holdout, the active subgroup is shifted and either broken or partially inverted
+
+    This keeps the shortcut real, but makes it less globally obvious.
+    """
     train_features = train_split["features"].copy()
     contaminated_eval_features = contaminated_eval_split["features"].copy()
     clean_holdout_features = clean_holdout_split["features"].copy()
@@ -393,18 +492,19 @@ def _inject_spurious_correlation(
     clean_holdout_labels = clean_holdout_split["labels"]
 
     rng = np.random.default_rng(config["RANDOM_STATE"])
-    source_frame = pd.concat([train_features, contaminated_eval_features], axis=0)
-    numeric = source_frame.select_dtypes(include=[np.number])
-    source_feature = numeric.var(axis=0).sort_values(ascending=False).index[0]
+    contaminated_source = pd.concat([train_features, contaminated_eval_features], axis=0)
+    contaminated_labels = pd.concat([train_labels, contaminated_eval_labels], axis=0)
+
+    group_variable = _choose_subgroup_feature(contaminated_source, contaminated_labels, excluded=[])
     group_edges = (
-        _quantile_edges(source_frame[source_feature], bins=4)
+        _quantile_edges(contaminated_source[group_variable], bins=4)
         if config["USE_GROUPS_FOR_SPURIOUS"]
         else np.array([-np.inf, np.inf])
     )
 
     def build_groups(frame: pd.DataFrame) -> pd.Series:
         if config["USE_GROUPS_FOR_SPURIOUS"]:
-            return _bin_series(frame[source_feature], group_edges)
+            return _bin_series(frame[group_variable], group_edges)
         return pd.Series(0, index=frame.index)
 
     train_groups = build_groups(train_features)
@@ -412,33 +512,54 @@ def _inject_spurious_correlation(
     clean_holdout_groups = build_groups(clean_holdout_features)
 
     unique_groups = sorted(pd.Index(train_groups.unique()).tolist())
+    active_groups = _pick_centered_groups(unique_groups, config["SPURIOUS_ACTIVE_GROUPS"])
+
+    shifted_active_groups = set()
+    if unique_groups:
+        ordered_groups = list(unique_groups)
+        for group in active_groups:
+            base_idx = ordered_groups.index(group)
+            shifted_idx = (base_idx + config["SPURIOUS_HOLDOUT_GROUP_SHIFT"]) % len(ordered_groups)
+            shifted_active_groups.add(ordered_groups[shifted_idx])
+
     group_biases = {
         group: float(bias)
-        for group, bias in zip(unique_groups, np.linspace(-0.6, 0.6, num=len(unique_groups)))
+        for group, bias in zip(unique_groups, np.linspace(-0.5, 0.5, num=len(unique_groups)))
     }
 
     def make_shortcut(labels: pd.Series, groups: pd.Series, mode: str) -> pd.Series:
-        signal = 2.0 * labels.astype(float) - 1.0
-        group_component = groups.map(group_biases).fillna(0.0).astype(float)
-        if mode == "broken":
-            # Truly broken: independent noise uncorrelated with label or groups. Correlation -> ~0.
-            shortcut = rng.normal(0.0, 0.35, size=len(labels))
-        elif mode == "inverted":
-            # Inverted but not catastrophic: partial inversion with higher noise to soften the effect.
-            inversion_strength = config["INVERTED_SIGNAL_WEIGHT"] * config["SPURIOUS_STRENGTH"]
-            shortcut = (
-                config["INVERTED_GROUP_WEIGHT"] * group_component
-                - inversion_strength * signal
-                + rng.normal(0.0, config["INVERTED_NOISE_STD"], size=len(labels))
-            )
+        signal = 2.0 * labels.astype(float).to_numpy() - 1.0
+        group_component = groups.map(group_biases).fillna(0.0).astype(float).to_numpy()
+
+        if mode == "train":
+            active_mask = groups.isin(active_groups).to_numpy()
         else:
-            # Train mode: strong signal, label-aligned with group structure.
-            shortcut = (
-                0.85 * group_component
-                + config["SPURIOUS_STRENGTH"] * signal
-                + rng.normal(0.0, 0.18, size=len(labels))
+            active_mask = groups.isin(shifted_active_groups).to_numpy()
+
+        values = rng.normal(0.0, config["SPURIOUS_OFFGROUP_NOISE_STD"], size=len(labels))
+        values[~active_mask] += config["SPURIOUS_OFFGROUP_SIGNAL_WEIGHT"] * signal[~active_mask]
+
+        if mode == "train":
+            values[active_mask] = (
+                0.55 * group_component[active_mask]
+                + config["SPURIOUS_STRENGTH"] * signal[active_mask]
+                + rng.normal(0.0, 0.18, size=int(active_mask.sum()))
             )
-        return pd.Series(shortcut, index=labels.index)
+        elif mode == "broken":
+            values[active_mask] = (
+                0.10 * group_component[active_mask]
+                + config["BROKEN_ACTIVE_SCALE"] * signal[active_mask]
+                + rng.normal(0.0, config["BROKEN_NOISE_STD"], size=int(active_mask.sum()))
+            )
+        elif mode == "inverted":
+            inversion_strength = config["INVERTED_SIGNAL_WEIGHT"] * config["SPURIOUS_STRENGTH"]
+            values[active_mask] = (
+                config["INVERTED_GROUP_WEIGHT"] * group_component[active_mask]
+                - inversion_strength * signal[active_mask]
+                + rng.normal(0.0, config["INVERTED_NOISE_STD"], size=int(active_mask.sum()))
+            )
+
+        return pd.Series(values, index=labels.index)
 
     train_shortcut = make_shortcut(train_labels, train_groups, "train")
     contaminated_eval_shortcut = make_shortcut(contaminated_eval_labels, contaminated_eval_groups, "train")
@@ -462,11 +583,13 @@ def _inject_spurious_correlation(
         "contaminated_eval_contaminated": True,
         "clean_holdout_contaminated": False,
         "domain_logic": {
-            "group_variable": source_feature if config["USE_GROUPS_FOR_SPURIOUS"] else "synthetic_constant_group",
-            "group_definition": "quantile_bins over train+contaminated_eval for shortcut groups",
+            "group_variable": group_variable if config["USE_GROUPS_FOR_SPURIOUS"] else "synthetic_constant_group",
+            "group_definition": "quantile_bins over train+contaminated_eval; shortcut mainly active in centered subgroup(s)",
+            "active_groups_offline": sorted(list(active_groups)),
+            "active_groups_holdout": sorted(list(shifted_active_groups)),
             "group_biases": group_biases,
         },
-        "holdout_behavior": "correlation breaks in clean_holdout" if config["SPURIOUS_MODE"] == "broken" else "correlation flips in clean_holdout",
+        "holdout_behavior": "subgroup shortcut breaks in clean_holdout" if config["SPURIOUS_MODE"] == "broken" else "subgroup shortcut partially inverts in clean_holdout",
         "train_correlation_strength": float(train_stats["correlation"]),
         "contaminated_eval_correlation_strength": float(contaminated_eval_stats["correlation"]),
         "clean_holdout_correlation_strength": float(clean_holdout_stats["correlation"]),

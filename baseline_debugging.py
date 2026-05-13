@@ -3,10 +3,13 @@
 This module implements deterministic baseline debugging using only classical signals:
 - Prediction-label discrepancies
 - Prediction uncertainty (confidence margins)
-- Feature correlations and importance
-- Split-wise behavior comparison (contaminated_eval vs clean_holdout)
+- Simple feature-label statistics on train and contaminated_eval
+- No clean_holdout access during detection
+- No feature_importances_, SHAP, LIME, or other attribution methods
 
-No explainability methods (SHAP, LIME, etc.) are used here.
+Important methodological rule:
+- clean_holdout is NOT used to generate suspect rankings
+- clean_holdout is only used later for objective evaluation of fix success
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics.cluster import mutual_info_score
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
 
@@ -34,8 +38,6 @@ def _compute_prediction_margins(
 
 def _compute_margins_from_proba(probas: np.ndarray) -> np.ndarray:
     """Compute binary-class confidence margins from class-1 probabilities."""
-    # For binary classification, the second probability is 1-p.
-    # Margin = |p - (1-p)| = |2p - 1|
     return np.abs(2.0 * probas - 1.0)
 
 
@@ -47,20 +49,65 @@ def _safe_correlation(series: pd.Series, labels: pd.Series) -> float:
     return 0.0 if pd.isna(value) else float(value)
 
 
+def _feature_proxy(feature: pd.Series, labels: pd.Series) -> Dict[str, float]:
+    """Compute simple classical statistics for one feature.
+
+    Returns:
+    - correlation
+    - mutual_information
+    - mean_gap between positive and negative class
+    """
+    if feature.nunique(dropna=True) < 2:
+        return {"correlation": 0.0, "mutual_information": 0.0, "mean_gap": 0.0}
+
+    ranked = feature.rank(method="first")
+    bin_count = min(10, max(2, int(ranked.nunique())))
+    try:
+        discretized = pd.qcut(ranked, q=bin_count, duplicates="drop", labels=False)
+    except ValueError:
+        discretized = pd.cut(ranked, bins=bin_count, labels=False, include_lowest=True)
+
+    discrete = pd.Series(discretized, index=feature.index).fillna(-1).astype(int)
+    positive = feature[labels == 1]
+    negative = feature[labels == 0]
+    mean_gap = abs(float(positive.mean() - negative.mean())) if len(positive) and len(negative) else 0.0
+
+    return {
+        "correlation": _safe_correlation(feature, labels),
+        "mutual_information": float(mutual_info_score(labels.astype(int), discrete)),
+        "mean_gap": mean_gap,
+    }
+
+
+def _normalize_series(series: pd.Series) -> pd.Series:
+    """Min-max normalize a series to [0, 1]."""
+    minimum = float(series.min())
+    maximum = float(series.max())
+    if np.isclose(minimum, maximum):
+        return pd.Series(np.zeros(len(series)), index=series.index)
+    return (series - minimum) / (maximum - minimum)
+
+
+def _summarize_feature_table(
+    features: pd.DataFrame,
+    labels: pd.Series,
+) -> pd.DataFrame:
+    """Build a per-feature statistics table."""
+    rows: Dict[str, Dict[str, float]] = {}
+    for feature_name in features.columns:
+        rows[feature_name] = _feature_proxy(features[feature_name], labels)
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
 def _compute_oof_probabilities(
     train_features: pd.DataFrame,
     train_labels: pd.Series,
     config: Dict[str, Any],
 ) -> np.ndarray:
-    """Compute out-of-fold probabilities for robust label-noise detection.
-
-    Using in-sample predictions on a flexible RandomForest is misleading because the model
-    can memorize noisy labels. Out-of-fold probabilities are a much fairer classical signal.
-    """
+    """Compute out-of-fold probabilities for robust label-noise detection."""
     cv_folds = int(config.get("LABEL_NOISE_CV_FOLDS", 5))
     cv_folds = max(2, cv_folds)
 
-    # Make sure we do not ask for more folds than the smallest class supports.
     min_class_count = int(train_labels.value_counts().min())
     cv_folds = min(cv_folds, min_class_count)
     cv_folds = max(2, cv_folds)
@@ -76,7 +123,6 @@ def _compute_oof_probabilities(
         random_state=int(config.get("RANDOM_STATE", 42)),
     )
 
-    # cross_val_predict keeps the original row order of train_features.
     oof_proba = cross_val_predict(
         probe_model,
         train_features,
@@ -90,50 +136,35 @@ def _compute_oof_probabilities(
 
 
 def _detect_label_noise(
-    model: RandomForestClassifier,
     train_split: Dict[str, pd.DataFrame | pd.Series],
     fault_metadata: Dict[str, Any],
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Detect label noise using classical non-XAI signals.
+    """Detect label noise using only classical sample-level signals.
 
-    Strategy:
-    1. Compute out-of-fold probabilities on training data
-    2. Build a suspicion score from:
-       - low probability assigned to the observed label
-       - prediction/label disagreement
-       - low confidence margin / high uncertainty
-    3. Rank training samples by suspicion score
-    4. Compare the top-k ranked samples with the actually flipped labels
-
-    Returns dict with suspect_indices, scores, precision_at_k, recall_at_k.
+    Uses:
+    - out-of-fold probability for observed label
+    - prediction/label disagreement
+    - low confidence margin / high uncertainty
     """
     train_features = train_split["features"]
     train_labels = train_split["labels"]
 
-    # Step 1: robust classical signal = OOF predictions instead of in-sample predictions
     oof_proba_pos = _compute_oof_probabilities(train_features, train_labels, config)
     observed_labels = train_labels.to_numpy().astype(int)
     predicted_labels = (oof_proba_pos >= 0.5).astype(int)
 
-    # Step 2: compute sample-wise classical suspicion signals
     prob_observed_label = np.where(observed_labels == 1, oof_proba_pos, 1.0 - oof_proba_pos)
     disagreement = (predicted_labels != observed_labels).astype(float)
     margins = _compute_margins_from_proba(oof_proba_pos)
     uncertainty = 1.0 - margins
 
-    # Higher = more suspicious.
-    # - low prob for observed label is the strongest signal
-    # - outright disagreement is a strong bonus
-    # - uncertainty adds a softer secondary signal
     suspicion_score = (
         0.60 * (1.0 - prob_observed_label)
         + 0.25 * disagreement
         + 0.15 * uncertainty
     )
 
-    # Step 3: rank samples by suspicion score, but keep REAL dataframe indices
     rank_positions = np.argsort(-suspicion_score)
     ranked_index_labels = train_features.index.to_numpy()[rank_positions]
     ranked_scores = suspicion_score[rank_positions]
@@ -141,7 +172,6 @@ def _detect_label_noise(
     suspect_indices = [int(idx) for idx in ranked_index_labels.tolist()]
     suspect_scores = ranked_scores.tolist()
 
-    # Step 4: evaluate against injected ground truth
     if "changed_indices" in fault_metadata:
         actual_noisy_indices = set(int(idx) for idx in fault_metadata["changed_indices"])
         k = len(actual_noisy_indices)
@@ -166,39 +196,65 @@ def _detect_label_noise(
     }
 
 
+def _rank_feature_candidates_from_offline_statistics(
+    train_features: pd.DataFrame,
+    train_labels: pd.Series,
+    contaminated_eval_features: pd.DataFrame,
+    contaminated_eval_labels: pd.Series,
+) -> Tuple[List[str], Dict[str, float]]:
+    """Rank suspicious features using only train + contaminated_eval statistics.
+
+    This intentionally avoids:
+    - clean_holdout
+    - feature_importances_
+    - any XAI / attribution signal
+
+    Rationale:
+    A realistic developer only sees the training data and the (possibly contaminated)
+    offline validation view. They can inspect simple correlations, mutual information,
+    and class-separation heuristics, but they do not have a perfectly clean reference set.
+    """
+    train_stats = _summarize_feature_table(train_features, train_labels)
+    eval_stats = _summarize_feature_table(contaminated_eval_features, contaminated_eval_labels)
+
+    train_corr = _normalize_series(train_stats["correlation"].abs())
+    eval_corr = _normalize_series(eval_stats["correlation"].abs())
+    train_mi = _normalize_series(train_stats["mutual_information"])
+    eval_mi = _normalize_series(eval_stats["mutual_information"])
+    mean_gap = _normalize_series((train_stats["mean_gap"] + eval_stats["mean_gap"]) / 2.0)
+
+    consistency = pd.concat([train_corr, eval_corr], axis=1).min(axis=1)
+
+    suspicion = (
+        0.30 * train_corr
+        + 0.25 * eval_corr
+        + 0.20 * consistency
+        + 0.15 * train_mi
+        + 0.05 * eval_mi
+        + 0.05 * mean_gap
+    )
+
+    suspect_features = suspicion.sort_values(ascending=False).index.tolist()
+    suspicion_scores = {feature: float(score) for feature, score in suspicion.items()}
+    return suspect_features, suspicion_scores
+
+
 def _detect_data_leakage(
-    model: RandomForestClassifier,
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
     fault_metadata: Dict[str, Any],
-    config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Detect data leakage using classical signals.
-
-    Strategy:
-    1. Compute feature importances from trained model
-    2. Compute feature correlations in contaminated_eval and clean_holdout
-    3. Identify features with high instability (correlated in contaminated, weak in clean)
-    4. Rank features by combined importance + instability score
-    5. Find rank of true leakage feature
-    """
+    """Detect data leakage using only train + contaminated_eval statistics."""
+    train_features = splits["train"]["features"]
+    train_labels = splits["train"]["labels"]
     contaminated_eval_features = splits["contaminated_eval"]["features"]
     contaminated_eval_labels = splits["contaminated_eval"]["labels"]
-    clean_holdout_features = splits["clean_holdout"]["features"]
-    clean_holdout_labels = splits["clean_holdout"]["labels"]
 
-    feature_importance = pd.Series(model.feature_importances_, index=contaminated_eval_features.columns)
-
-    contaminated_corr = contaminated_eval_features.apply(
-        lambda col: abs(_safe_correlation(col, contaminated_eval_labels))
+    suspect_features, suspicion_scores = _rank_feature_candidates_from_offline_statistics(
+        train_features,
+        train_labels,
+        contaminated_eval_features,
+        contaminated_eval_labels,
     )
-    clean_corr = clean_holdout_features.apply(
-        lambda col: abs(_safe_correlation(col, clean_holdout_labels))
-    )
-
-    instability = contaminated_corr - clean_corr
-    suspicion = 0.65 * instability + 0.35 * feature_importance
-    suspect_features = suspicion.sort_values(ascending=False).index.tolist()
 
     if "leakage_feature_name" in fault_metadata:
         true_feature = fault_metadata["leakage_feature_name"]
@@ -211,49 +267,34 @@ def _detect_data_leakage(
 
     return {
         "suspect_features": suspect_features,
-        "suspicion_scores": suspicion.to_dict(),
+        "suspicion_scores": suspicion_scores,
         "rank_true_feature": rank_true_feature,
         "top_candidate_feature": suspect_features[0] if suspect_features else None,
     }
 
 
 def _detect_spurious_correlation(
-    model: RandomForestClassifier,
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
     fault_metadata: Dict[str, Any],
-    config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Detect spurious correlation using classical signals.
+    """Detect spurious correlation using only train + contaminated_eval statistics.
 
-    Strategy:
-    1. Compute feature importances from model
-    2. Compute feature correlations in train, contaminated_eval, and clean_holdout
-    3. Identify features important offline but unstable in clean_holdout
-    4. Rank by combined instability + importance
-    5. Find rank of true spurious feature
+    Baseline rule:
+    - features that look globally very predictive across the offline world
+      are suspicious shortcut candidates
+    - no clean_holdout is used during this ranking
     """
     train_features = splits["train"]["features"]
     train_labels = splits["train"]["labels"]
     contaminated_eval_features = splits["contaminated_eval"]["features"]
     contaminated_eval_labels = splits["contaminated_eval"]["labels"]
-    clean_holdout_features = splits["clean_holdout"]["features"]
-    clean_holdout_labels = splits["clean_holdout"]["labels"]
 
-    feature_importance = pd.Series(model.feature_importances_, index=train_features.columns)
-
-    train_corr = train_features.apply(lambda col: abs(_safe_correlation(col, train_labels)))
-    contaminated_corr = contaminated_eval_features.apply(
-        lambda col: abs(_safe_correlation(col, contaminated_eval_labels))
+    suspect_features, suspicion_scores = _rank_feature_candidates_from_offline_statistics(
+        train_features,
+        train_labels,
+        contaminated_eval_features,
+        contaminated_eval_labels,
     )
-    clean_corr = clean_holdout_features.apply(
-        lambda col: abs(_safe_correlation(col, clean_holdout_labels))
-    )
-
-    max_offline_corr = pd.concat([train_corr, contaminated_corr], axis=1).max(axis=1)
-    instability = max_offline_corr - clean_corr
-    suspicion = 0.70 * instability + 0.30 * feature_importance
-    suspect_features = suspicion.sort_values(ascending=False).index.tolist()
 
     if "feature_name" in fault_metadata:
         true_feature = fault_metadata["feature_name"]
@@ -266,7 +307,7 @@ def _detect_spurious_correlation(
 
     return {
         "suspect_features": suspect_features,
-        "suspicion_scores": suspicion.to_dict(),
+        "suspicion_scores": suspicion_scores,
         "rank_true_feature": rank_true_feature,
         "top_candidate_feature": suspect_features[0] if suspect_features else None,
     }
@@ -278,13 +319,7 @@ def _apply_label_noise_fix(
     suspect_indices: List[int],
     max_fixes: int,
 ) -> Tuple[pd.DataFrame, pd.Series, List[int]]:
-    """
-    Fix label noise by correcting ONLY the top-k suspected samples using original labels.
-
-    This is the key bugfix:
-    - previously, all changed labels were reverted regardless of the detector output
-    - now, only the top-k suspects are corrected
-    """
+    """Fix only the top-k suspected noisy samples using stored original labels."""
     corrected_labels = train_split["labels"].copy()
     corrected_indices: List[int] = []
 
@@ -308,7 +343,7 @@ def _apply_feature_removal_fix(
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
     feature_to_remove: str,
 ) -> Dict[str, Dict[str, pd.DataFrame | pd.Series]]:
-    """Remove a suspected feature from all splits."""
+    """Remove one suspected feature from all splits."""
     fixed_splits = {}
     for split_name, split_data in splits.items():
         if feature_to_remove in split_data["features"].columns:
@@ -327,7 +362,7 @@ def _compute_split_metrics(
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
 ) -> Dict[str, float]:
     """Compute accuracy, F1, and ROC-AUC for all splits."""
-    metrics = {}
+    metrics: Dict[str, float] = {}
     for split_name in ["train", "contaminated_eval", "clean_holdout"]:
         split = splits[split_name]
         features = split["features"]
@@ -350,16 +385,11 @@ def run_baseline_debugging(
     injected_splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
     config: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Run baseline debugging workflow.
+    """Run the baseline debugging workflow.
 
-    Steps:
-    1. Compute metrics before fix
-    2. Perform fault-specific detection
-    3. Apply fix
-    4. Retrain model on fixed data
-    5. Compute metrics after fix
-    6. Return standardized results
+    Important:
+    - clean_holdout is used ONLY for evaluation after the ranking/fix decision is made
+    - detection itself uses only train + contaminated_eval
     """
     if config is None:
         config = {}
@@ -385,8 +415,7 @@ def run_baseline_debugging(
     steps_to_detect = 0
 
     if fault_type == "label_noise":
-        detection_result = _detect_label_noise(model, injected_splits["train"], fault_metadata, config)
-        # OOF prediction + score construction + ranking + localization
+        detection_result = _detect_label_noise(injected_splits["train"], fault_metadata, config)
         steps_to_detect = 5
 
         k = int(detection_result.get("top_k_used_for_eval", 0))
@@ -414,14 +443,11 @@ def run_baseline_debugging(
         detection_result["corrected_indices"] = corrected_indices
 
     elif fault_type == "data_leakage":
-        detection_result = _detect_data_leakage(model, injected_splits, fault_metadata, config)
+        detection_result = _detect_data_leakage(injected_splits, fault_metadata)
         steps_to_detect = 4
 
         suspect_feature = detection_result["top_candidate_feature"]
-        if suspect_feature:
-            fixed_splits = _apply_feature_removal_fix(injected_splits, suspect_feature)
-        else:
-            fixed_splits = injected_splits
+        fixed_splits = _apply_feature_removal_fix(injected_splits, suspect_feature) if suspect_feature else injected_splits
 
         retrained_model = RandomForestClassifier(
             n_estimators=int(config.get("N_ESTIMATORS", 200)),
@@ -431,14 +457,11 @@ def run_baseline_debugging(
         metrics_after = _compute_split_metrics(retrained_model, fixed_splits)
 
     elif fault_type == "spurious_correlation":
-        detection_result = _detect_spurious_correlation(model, injected_splits, fault_metadata, config)
+        detection_result = _detect_spurious_correlation(injected_splits, fault_metadata)
         steps_to_detect = 4
 
         suspect_feature = detection_result["top_candidate_feature"]
-        if suspect_feature:
-            fixed_splits = _apply_feature_removal_fix(injected_splits, suspect_feature)
-        else:
-            fixed_splits = injected_splits
+        fixed_splits = _apply_feature_removal_fix(injected_splits, suspect_feature) if suspect_feature else injected_splits
 
         retrained_model = RandomForestClassifier(
             n_estimators=int(config.get("N_ESTIMATORS", 200)),
