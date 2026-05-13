@@ -12,12 +12,13 @@ No explainability methods (SHAP, LIME, etc.) are used here.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
 
 def _compute_prediction_margins(
@@ -31,12 +32,61 @@ def _compute_prediction_margins(
     return margins
 
 
+def _compute_margins_from_proba(probas: np.ndarray) -> np.ndarray:
+    """Compute binary-class confidence margins from class-1 probabilities."""
+    # For binary classification, the second probability is 1-p.
+    # Margin = |p - (1-p)| = |2p - 1|
+    return np.abs(2.0 * probas - 1.0)
+
+
 def _safe_correlation(series: pd.Series, labels: pd.Series) -> float:
     """Safely compute Pearson correlation, returning 0 if undefined."""
     if series.nunique(dropna=True) < 2 or labels.nunique(dropna=True) < 2:
         return 0.0
     value = series.corr(labels)
     return 0.0 if pd.isna(value) else float(value)
+
+
+def _compute_oof_probabilities(
+    train_features: pd.DataFrame,
+    train_labels: pd.Series,
+    config: Dict[str, Any],
+) -> np.ndarray:
+    """Compute out-of-fold probabilities for robust label-noise detection.
+
+    Using in-sample predictions on a flexible RandomForest is misleading because the model
+    can memorize noisy labels. Out-of-fold probabilities are a much fairer classical signal.
+    """
+    cv_folds = int(config.get("LABEL_NOISE_CV_FOLDS", 5))
+    cv_folds = max(2, cv_folds)
+
+    # Make sure we do not ask for more folds than the smallest class supports.
+    min_class_count = int(train_labels.value_counts().min())
+    cv_folds = min(cv_folds, min_class_count)
+    cv_folds = max(2, cv_folds)
+
+    cv = StratifiedKFold(
+        n_splits=cv_folds,
+        shuffle=True,
+        random_state=int(config.get("RANDOM_STATE", 42)),
+    )
+
+    probe_model = RandomForestClassifier(
+        n_estimators=int(config.get("N_ESTIMATORS", 200)),
+        random_state=int(config.get("RANDOM_STATE", 42)),
+    )
+
+    # cross_val_predict keeps the original row order of train_features.
+    oof_proba = cross_val_predict(
+        probe_model,
+        train_features,
+        train_labels,
+        cv=cv,
+        method="predict_proba",
+        n_jobs=None,
+    )[:, 1]
+
+    return oof_proba
 
 
 def _detect_label_noise(
@@ -46,54 +96,73 @@ def _detect_label_noise(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Detect label noise using classical signals.
-    
+    Detect label noise using classical non-XAI signals.
+
     Strategy:
-    1. Compute model predictions on training data
-    2. Identify prediction-label discrepancies
-    3. Weight discrepancies by prediction margin (uncertainty)
-    4. Rank training samples by suspicion score
-    5. Compare with actual noisy labels to compute precision/recall@k
-    
+    1. Compute out-of-fold probabilities on training data
+    2. Build a suspicion score from:
+       - low probability assigned to the observed label
+       - prediction/label disagreement
+       - low confidence margin / high uncertainty
+    3. Rank training samples by suspicion score
+    4. Compare the top-k ranked samples with the actually flipped labels
+
     Returns dict with suspect_indices, scores, precision_at_k, recall_at_k.
     """
     train_features = train_split["features"]
     train_labels = train_split["labels"]
 
-    # Step 1: Get predictions and margins
-    predictions = model.predict(train_features).astype(int)
-    margins = _compute_prediction_margins(model, train_features)
+    # Step 1: robust classical signal = OOF predictions instead of in-sample predictions
+    oof_proba_pos = _compute_oof_probabilities(train_features, train_labels, config)
+    observed_labels = train_labels.to_numpy().astype(int)
+    predicted_labels = (oof_proba_pos >= 0.5).astype(int)
 
-    # Step 2: Compute discrepancy score
-    # Wrong predictions weighted by uncertainty are more suspicious
-    is_wrong = (predictions != train_labels.values.astype(int)).astype(float)
-    discrepancy_score = is_wrong * (1.0 - margins)
+    # Step 2: compute sample-wise classical suspicion signals
+    prob_observed_label = np.where(observed_labels == 1, oof_proba_pos, 1.0 - oof_proba_pos)
+    disagreement = (predicted_labels != observed_labels).astype(float)
+    margins = _compute_margins_from_proba(oof_proba_pos)
+    uncertainty = 1.0 - margins
 
-    # Step 3: Rank samples by suspicion (higher = more suspicious)
-    suspect_indices = np.argsort(-discrepancy_score)
-    suspect_scores = discrepancy_score[suspect_indices]
+    # Higher = more suspicious.
+    # - low prob for observed label is the strongest signal
+    # - outright disagreement is a strong bonus
+    # - uncertainty adds a softer secondary signal
+    suspicion_score = (
+        0.60 * (1.0 - prob_observed_label)
+        + 0.25 * disagreement
+        + 0.15 * uncertainty
+    )
 
-    # Step 4: Evaluate against ground truth
+    # Step 3: rank samples by suspicion score, but keep REAL dataframe indices
+    rank_positions = np.argsort(-suspicion_score)
+    ranked_index_labels = train_features.index.to_numpy()[rank_positions]
+    ranked_scores = suspicion_score[rank_positions]
+
+    suspect_indices = [int(idx) for idx in ranked_index_labels.tolist()]
+    suspect_scores = ranked_scores.tolist()
+
+    # Step 4: evaluate against injected ground truth
     if "changed_indices" in fault_metadata:
-        actual_noisy_indices = set(fault_metadata["changed_indices"])
-        # Select top-k suspects (k = number of actual noisy labels)
+        actual_noisy_indices = set(int(idx) for idx in fault_metadata["changed_indices"])
         k = len(actual_noisy_indices)
-        suspect_set = set(suspect_indices[:k])
 
-        # Precision @ k: fraction of top-k that are actually noisy
+        top_k_suspects = suspect_indices[:k]
+        suspect_set = set(top_k_suspects)
+
         true_positives = len(suspect_set & actual_noisy_indices)
         precision_at_k = float(true_positives) / float(k) if k > 0 else 0.0
-        # Recall @ k: fraction of actual noisy labels in top-k
         recall_at_k = float(true_positives) / float(len(actual_noisy_indices)) if len(actual_noisy_indices) > 0 else 0.0
     else:
+        k = 0
         precision_at_k = 0.0
         recall_at_k = 0.0
 
     return {
-        "suspect_indices": suspect_indices.tolist(),
-        "suspect_scores": suspect_scores.tolist(),
+        "suspect_indices": suspect_indices,
+        "suspect_scores": suspect_scores,
         "precision_at_k": precision_at_k,
         "recall_at_k": recall_at_k,
+        "top_k_used_for_eval": k,
     }
 
 
@@ -105,25 +174,21 @@ def _detect_data_leakage(
 ) -> Dict[str, Any]:
     """
     Detect data leakage using classical signals.
-    
+
     Strategy:
     1. Compute feature importances from trained model
     2. Compute feature correlations in contaminated_eval and clean_holdout
     3. Identify features with high instability (correlated in contaminated, weak in clean)
     4. Rank features by combined importance + instability score
     5. Find rank of true leakage feature
-    
-    Returns dict with suspect_features, suspicion_scores, rank_true_feature, top_candidate.
     """
     contaminated_eval_features = splits["contaminated_eval"]["features"]
     contaminated_eval_labels = splits["contaminated_eval"]["labels"]
     clean_holdout_features = splits["clean_holdout"]["features"]
     clean_holdout_labels = splits["clean_holdout"]["labels"]
 
-    # Step 1: Extract feature importances
     feature_importance = pd.Series(model.feature_importances_, index=contaminated_eval_features.columns)
 
-    # Step 2: Compute correlations in each view
     contaminated_corr = contaminated_eval_features.apply(
         lambda col: abs(_safe_correlation(col, contaminated_eval_labels))
     )
@@ -131,18 +196,10 @@ def _detect_data_leakage(
         lambda col: abs(_safe_correlation(col, clean_holdout_labels))
     )
 
-    # Step 3: Compute instability metric
-    # High correlation in contaminated but weak in clean = suspicious
     instability = contaminated_corr - clean_corr
-
-    # Step 4: Combine signals
-    # Prioritize instability (distribution shift) over importance
     suspicion = 0.65 * instability + 0.35 * feature_importance
-
-    # Step 5: Sort features by suspicion
     suspect_features = suspicion.sort_values(ascending=False).index.tolist()
 
-    # Step 6: Find rank of true leakage feature
     if "leakage_feature_name" in fault_metadata:
         true_feature = fault_metadata["leakage_feature_name"]
         try:
@@ -168,15 +225,13 @@ def _detect_spurious_correlation(
 ) -> Dict[str, Any]:
     """
     Detect spurious correlation using classical signals.
-    
+
     Strategy:
-    1. Compute feature importances from model (trained on contaminated data)
-    2. Compute feature correlations in train, contaminated_eval, and clean_holdout views
-    3. Identify features that are important in train/contaminated but unstable in clean_holdout
-    4. Rank by instability metric: (max_train_corr - clean_corr) * importance
+    1. Compute feature importances from model
+    2. Compute feature correlations in train, contaminated_eval, and clean_holdout
+    3. Identify features important offline but unstable in clean_holdout
+    4. Rank by combined instability + importance
     5. Find rank of true spurious feature
-    
-    Returns dict with suspect_features, suspicion_scores, rank_true_feature, top_candidate.
     """
     train_features = splits["train"]["features"]
     train_labels = splits["train"]["labels"]
@@ -185,10 +240,8 @@ def _detect_spurious_correlation(
     clean_holdout_features = splits["clean_holdout"]["features"]
     clean_holdout_labels = splits["clean_holdout"]["labels"]
 
-    # Step 1: Extract feature importances
     feature_importance = pd.Series(model.feature_importances_, index=train_features.columns)
 
-    # Step 2: Compute correlations in each view
     train_corr = train_features.apply(lambda col: abs(_safe_correlation(col, train_labels)))
     contaminated_corr = contaminated_eval_features.apply(
         lambda col: abs(_safe_correlation(col, contaminated_eval_labels))
@@ -197,19 +250,11 @@ def _detect_spurious_correlation(
         lambda col: abs(_safe_correlation(col, clean_holdout_labels))
     )
 
-    # Step 3: Compute instability metric
-    # Features that are correlated in train/contaminated but weak in clean are suspicious
     max_offline_corr = pd.concat([train_corr, contaminated_corr], axis=1).max(axis=1)
     instability = max_offline_corr - clean_corr
-
-    # Step 4: Combine signals
-    # Prioritize instability (domain shift indicator) over raw importance
     suspicion = 0.70 * instability + 0.30 * feature_importance
-
-    # Step 5: Sort features by suspicion
     suspect_features = suspicion.sort_values(ascending=False).index.tolist()
 
-    # Step 6: Find rank of true spurious feature
     if "feature_name" in fault_metadata:
         true_feature = fault_metadata["feature_name"]
         try:
@@ -230,24 +275,33 @@ def _detect_spurious_correlation(
 def _apply_label_noise_fix(
     train_split: Dict[str, pd.DataFrame | pd.Series],
     fault_metadata: Dict[str, Any],
-) -> tuple[pd.DataFrame, pd.Series]:
+    suspect_indices: List[int],
+    max_fixes: int,
+) -> Tuple[pd.DataFrame, pd.Series, List[int]]:
     """
-    Fix label noise by correcting suspected samples using original labels.
-    
-    Uses all samples marked as changed in fault_metadata and reverts them
-    to their original labels.
+    Fix label noise by correcting ONLY the top-k suspected samples using original labels.
+
+    This is the key bugfix:
+    - previously, all changed labels were reverted regardless of the detector output
+    - now, only the top-k suspects are corrected
     """
     corrected_labels = train_split["labels"].copy()
+    corrected_indices: List[int] = []
 
-    if "original_labels_by_index" in fault_metadata:
-        original_labels_dict = fault_metadata["original_labels_by_index"]
-        for str_idx, original_label in original_labels_dict.items():
-            idx = int(str_idx)
-            # Use .loc to access by index label (not position)
-            if idx in corrected_labels.index:
-                corrected_labels.loc[idx] = original_label
+    if "original_labels_by_index" not in fault_metadata:
+        return train_split["features"], corrected_labels, corrected_indices
 
-    return train_split["features"], corrected_labels
+    original_labels_dict = {
+        int(idx): int(label)
+        for idx, label in fault_metadata["original_labels_by_index"].items()
+    }
+
+    for idx in suspect_indices[:max_fixes]:
+        if idx in original_labels_dict and idx in corrected_labels.index:
+            corrected_labels.loc[idx] = original_labels_dict[idx]
+            corrected_indices.append(int(idx))
+
+    return train_split["features"], corrected_labels, corrected_indices
 
 
 def _apply_feature_removal_fix(
@@ -298,35 +352,21 @@ def run_baseline_debugging(
 ) -> Dict[str, Any]:
     """
     Run baseline debugging workflow.
-    
+
     Steps:
     1. Compute metrics before fix
-    2. Perform fault-specific detection (label noise / leakage / spurious)
-    3. Apply fix (correct labels / remove feature)
+    2. Perform fault-specific detection
+    3. Apply fix
     4. Retrain model on fixed data
     5. Compute metrics after fix
     6. Return standardized results
-    
-    Args:
-        model: Trained RandomForestClassifier
-        fault_type: "label_noise", "data_leakage", "spurious_correlation", or "none"
-        fault_metadata: Metadata dict from fault injection
-        injected_splits: Dict of train/contaminated_eval/clean_holdout splits with injected faults
-        config: Optional config dict with RANDOM_STATE, N_ESTIMATORS, etc.
-    
-    Returns:
-        Dict with metrics_before, metrics_after, detection results, fix_impact,
-        steps_to_detect, retrains, runtime_sec, and fault-specific fields.
     """
     if config is None:
         config = {}
 
     start_time = time.time()
-
-    # Step 1: Metrics before fix
     metrics_before = _compute_split_metrics(model, injected_splits)
 
-    # Step 2: No fault case
     if fault_type == "none":
         metrics_after = metrics_before
         fix_impact = {key: 0.0 for key in metrics_before.keys()}
@@ -341,26 +381,28 @@ def run_baseline_debugging(
             "runtime_sec": float(time.time() - start_time),
         }
 
-    # Step 2: Fault-specific detection
-    detection_result = {}
+    detection_result: Dict[str, Any] = {}
     steps_to_detect = 0
 
     if fault_type == "label_noise":
-        # 4 steps: feature/prediction loading, margin computation, discrepancy scoring, ranking
         detection_result = _detect_label_noise(model, injected_splits["train"], fault_metadata, config)
-        steps_to_detect = 4
+        # OOF prediction + score construction + ranking + localization
+        steps_to_detect = 5
 
-        # Step 3: Apply fix (correct labels)
-        fixed_features, fixed_labels = _apply_label_noise_fix(injected_splits["train"], fault_metadata)
+        k = int(detection_result.get("top_k_used_for_eval", 0))
+        fixed_features, fixed_labels, corrected_indices = _apply_label_noise_fix(
+            injected_splits["train"],
+            fault_metadata,
+            detection_result.get("suspect_indices", []),
+            k,
+        )
 
-        # Step 4: Retrain model
         retrained_model = RandomForestClassifier(
-            n_estimators=config.get("N_ESTIMATORS", 200),
-            random_state=config.get("RANDOM_STATE", 42),
+            n_estimators=int(config.get("N_ESTIMATORS", 200)),
+            random_state=int(config.get("RANDOM_STATE", 42)),
         )
         retrained_model.fit(fixed_features, fixed_labels)
 
-        # Step 5: Compute metrics after (on original splits with corrected labels)
         eval_splits = {
             "train": {"features": fixed_features, "labels": fixed_labels},
             "contaminated_eval": injected_splits["contaminated_eval"],
@@ -368,52 +410,44 @@ def run_baseline_debugging(
         }
         metrics_after = _compute_split_metrics(retrained_model, eval_splits)
 
+        detection_result["applied_fix_count"] = len(corrected_indices)
+        detection_result["corrected_indices"] = corrected_indices
+
     elif fault_type == "data_leakage":
-        # 4 steps: feature correlation, importance, instability analysis, ranking
         detection_result = _detect_data_leakage(model, injected_splits, fault_metadata, config)
         steps_to_detect = 4
 
-        # Step 3: Apply fix (remove leakage feature)
         suspect_feature = detection_result["top_candidate_feature"]
         if suspect_feature:
             fixed_splits = _apply_feature_removal_fix(injected_splits, suspect_feature)
         else:
             fixed_splits = injected_splits
 
-        # Step 4: Retrain model
         retrained_model = RandomForestClassifier(
-            n_estimators=config.get("N_ESTIMATORS", 200),
-            random_state=config.get("RANDOM_STATE", 42),
+            n_estimators=int(config.get("N_ESTIMATORS", 200)),
+            random_state=int(config.get("RANDOM_STATE", 42)),
         )
         retrained_model.fit(fixed_splits["train"]["features"], fixed_splits["train"]["labels"])
-
-        # Step 5: Compute metrics after
         metrics_after = _compute_split_metrics(retrained_model, fixed_splits)
 
     elif fault_type == "spurious_correlation":
-        # 4 steps: feature importance, correlations, instability detection, ranking
         detection_result = _detect_spurious_correlation(model, injected_splits, fault_metadata, config)
         steps_to_detect = 4
 
-        # Step 3: Apply fix (remove spurious feature)
         suspect_feature = detection_result["top_candidate_feature"]
         if suspect_feature:
             fixed_splits = _apply_feature_removal_fix(injected_splits, suspect_feature)
         else:
             fixed_splits = injected_splits
 
-        # Step 4: Retrain model
         retrained_model = RandomForestClassifier(
-            n_estimators=config.get("N_ESTIMATORS", 200),
-            random_state=config.get("RANDOM_STATE", 42),
+            n_estimators=int(config.get("N_ESTIMATORS", 200)),
+            random_state=int(config.get("RANDOM_STATE", 42)),
         )
         retrained_model.fit(fixed_splits["train"]["features"], fixed_splits["train"]["labels"])
-
-        # Step 5: Compute metrics after
         metrics_after = _compute_split_metrics(retrained_model, fixed_splits)
 
     else:
-        # Unknown fault type
         metrics_after = metrics_before
         fix_impact = {key: 0.0 for key in metrics_before.keys()}
         return {
@@ -427,13 +461,11 @@ def run_baseline_debugging(
             "runtime_sec": float(time.time() - start_time),
         }
 
-    # Step 6: Compute fix impact
     fix_impact = {
         key: metrics_after.get(key, 0.0) - metrics_before.get(key, 0.0)
         for key in metrics_before.keys()
     }
 
-    # Build standardized result
     result = {
         "workflow": "baseline",
         "fault_type": fault_type,
@@ -441,11 +473,8 @@ def run_baseline_debugging(
         "metrics_after": metrics_after,
         "fix_impact": fix_impact,
         "steps_to_detect": steps_to_detect,
-        "retrains": 1,  # One retrain after fix
+        "retrains": 1,
         "runtime_sec": float(time.time() - start_time),
     }
-
-    # Add fault-specific detection results
     result.update(detection_result)
-
     return result

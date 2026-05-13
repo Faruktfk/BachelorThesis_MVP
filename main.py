@@ -396,9 +396,9 @@ def main() -> Dict[str, Any]:
         injected_splits["clean_holdout"]["labels"],
     )
 
-    print(f"\n{'='*70}")
+    print(f"\n{'*'*70}")
     print("FAULT INJECTION & INITIAL TRAINING")
-    print(f"{'='*70}")
+    print(f"{'*'*70}")
     print(f"Active fault type: {FAULT_TYPE}")
     print("\nFault metadata:")
     print(json.dumps(fault_metadata, indent=2, ensure_ascii=False))
@@ -428,9 +428,9 @@ def main() -> Dict[str, Any]:
     }
 
     # Run baseline debugging
-    print(f"\n{'='*70}")
+    print(f"\n{'*'*70}")
     print("BASELINE DEBUGGING (NO XAI)")
-    print(f"{'='*70}")
+    print(f"{'*'*70}")
     baseline_result = baseline_debugging.run_baseline_debugging(
         model=model,
         fault_type=FAULT_TYPE,
