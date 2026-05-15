@@ -6,9 +6,9 @@ baseline_debugging.py, but uses SHAP values to build suspect rankings.
 Methodological rules:
 - Detection uses only train + contaminated_eval
 - clean_holdout is used only for objective evaluation after the ranking/fix decision
-- For feature faults, ranking is subgroup-sensitive:
-  it emphasizes tail SHAP behavior and concentration instead of only global mean importance
-- For label noise, ranking combines OOF classical suspicion with SHAP profile mismatch
+- For feature faults, ranking is hybrid:
+  it combines global SHAP strength with local spike / concentration behavior
+- For label noise, SHAP acts as a reranker on top of a strong classical OOF baseline
 """
 
 from __future__ import annotations
@@ -22,11 +22,6 @@ import shap
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
-
-
-def _compute_margins_from_proba(proba: np.ndarray) -> np.ndarray:
-    """Convert positive-class probabilities to symmetric margins in [0,1]."""
-    return np.abs(2.0 * np.asarray(proba) - 1.0)
 
 
 def _normalize_series(series: pd.Series) -> pd.Series:
@@ -108,7 +103,7 @@ def _build_tree_explainer(
     model: RandomForestClassifier,
     background: pd.DataFrame,
 ):
-    """Build a SHAP explainer with a probability-scale attempt first, raw fallback second."""
+    """Build a SHAP explainer with probability-scale attempt first, raw fallback second."""
     try:
         return shap.TreeExplainer(
             model,
@@ -149,9 +144,6 @@ def _extract_positive_class_shap_values(
         return values
 
     if values.ndim == 3:
-        # Common shapes:
-        # (n_samples, n_features, n_outputs)
-        # (n_outputs, n_samples, n_features)
         if values.shape[-1] == 2:
             return values[:, :, 1]
         if values.shape[0] == 2:
@@ -176,52 +168,135 @@ def _row_normalize_abs_profiles(abs_profiles: np.ndarray) -> np.ndarray:
     return abs_profiles / row_sums
 
 
-def _feature_tail_statistics(
+def _compute_feature_focus_slice(
+    model: RandomForestClassifier,
+    offline_features: pd.DataFrame,
     abs_shap_values: np.ndarray,
-    feature_names: List[str],
-) -> pd.DataFrame:
-    """Compute subgroup-sensitive SHAP summary statistics per feature.
+    config: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build a focus slice for feature-fault ranking.
 
-    The goal is to surface features that:
-    - are not globally dominant,
-    - but have strong local bursts in a subset of samples.
+    We want a subset of samples where the model appears to rely strongly on a small number
+    of features. This helps both:
+    - direct leakage (globally dominant feature)
+    - subgroup-local faults (local spikes in a subset)
+    """
+    probabilities = model.predict_proba(offline_features)[:, 1]
+    confidence = np.abs(2.0 * probabilities - 1.0)
+
+    total_abs = abs_shap_values.sum(axis=1)
+    total_abs_safe = total_abs.copy()
+    total_abs_safe[total_abs_safe <= 1e-12] = 1.0
+
+    share = abs_shap_values / total_abs_safe[:, None]
+    dominance = share.max(axis=1)
+
+    risk = (
+        0.45 * _normalize_series(pd.Series(dominance)).to_numpy()
+        + 0.30 * _normalize_series(pd.Series(total_abs)).to_numpy()
+        + 0.25 * _normalize_series(pd.Series(confidence)).to_numpy()
+    )
+
+    focus_fraction = float(config.get("XAI_FEATURE_FOCUS_FRACTION", 0.20))
+    focus_fraction = min(max(focus_fraction, 0.05), 0.50)
+    focus_n = max(10, int(np.ceil(focus_fraction * len(offline_features))))
+    focus_idx = np.argsort(-risk)[:focus_n]
+
+    return focus_idx, share
+
+
+def _feature_hybrid_statistics(
+    model: RandomForestClassifier,
+    offline_features: pd.DataFrame,
+    abs_shap_values: np.ndarray,
+    config: Dict[str, Any],
+) -> pd.DataFrame:
+    """Compute hybrid SHAP feature statistics.
+
+    This score intentionally combines:
+    - global signal (for direct leakage or broadly important shortcuts)
+    - local spikes and concentration (for subgroup-local faults)
     """
     n_samples, n_features = abs_shap_values.shape
-    top_count = max(1, int(np.ceil(0.10 * n_samples)))
-    topk = min(3, n_features)
+    feature_names = list(offline_features.columns)
 
+    focus_idx, share = _compute_feature_focus_slice(model, offline_features, abs_shap_values, config)
+
+    topk = min(3, n_features)
     topk_idx = np.argpartition(abs_shap_values, kth=n_features - topk, axis=1)[:, -topk:]
+    winner_idx = np.argmax(abs_shap_values, axis=1)
+
     topk_counts = np.zeros(n_features, dtype=float)
+    winner_counts = np.zeros(n_features, dtype=float)
+
     for row in topk_idx:
         topk_counts[row] += 1.0
+    for idx in winner_idx:
+        winner_counts[idx] += 1.0
+
     topk_rate = topk_counts / float(n_samples)
+    winner_rate = winner_counts / float(n_samples)
+
+    focus_topk_idx = topk_idx[focus_idx]
+    focus_winner_idx = winner_idx[focus_idx]
+
+    focus_topk_counts = np.zeros(n_features, dtype=float)
+    focus_winner_counts = np.zeros(n_features, dtype=float)
+
+    for row in focus_topk_idx:
+        focus_topk_counts[row] += 1.0
+    for idx in focus_winner_idx:
+        focus_winner_counts[idx] += 1.0
+
+    focus_topk_rate = focus_topk_counts / float(len(focus_idx))
+    focus_winner_rate = focus_winner_counts / float(len(focus_idx))
+
+    top_count = max(1, int(np.ceil(0.10 * n_samples)))
 
     rows: Dict[str, Dict[str, float]] = {}
     for j, feature_name in enumerate(feature_names):
         values = abs_shap_values[:, j]
+        focus_values = abs_shap_values[focus_idx, j]
+        shares = share[:, j]
+        focus_shares = share[focus_idx, j]
+
         mean_abs = float(np.mean(values))
-        q90 = float(np.quantile(values, 0.90))
-        q95 = float(np.quantile(values, 0.95))
+        q90_abs = float(np.quantile(values, 0.90))
+        q95_abs = float(np.quantile(values, 0.95))
         top_sorted = np.sort(values)
-        top_share = float(np.sum(top_sorted[-top_count:]) / (np.sum(values) + 1e-12))
-        peak_ratio = float(q95 / (mean_abs + 1e-12))
+        top10_share = float(np.sum(top_sorted[-top_count:]) / (np.sum(values) + 1e-12))
+
+        focus_mean_abs = float(np.mean(focus_values))
+        focus_mean_share = float(np.mean(focus_shares))
+        focus_q90_abs = float(np.quantile(focus_values, 0.90))
+
         rows[feature_name] = {
             "mean_abs_shap": mean_abs,
-            "q90_abs_shap": q90,
-            "q95_abs_shap": q95,
-            "top10_share": top_share,
-            "peak_ratio": peak_ratio,
+            "q90_abs_shap": q90_abs,
+            "q95_abs_shap": q95_abs,
+            "top10_share": top10_share,
             "top3_rate": float(topk_rate[j]),
+            "winner_rate": float(winner_rate[j]),
+            "focus_mean_abs_shap": focus_mean_abs,
+            "focus_q90_abs_shap": focus_q90_abs,
+            "focus_mean_share": focus_mean_share,
+            "focus_top3_rate": float(focus_topk_rate[j]),
+            "focus_winner_rate": float(focus_winner_rate[j]),
         }
 
     stats = pd.DataFrame.from_dict(rows, orient="index")
 
     score = (
-        0.40 * _normalize_series(stats["peak_ratio"])
-        + 0.25 * _normalize_series(stats["top10_share"])
-        + 0.20 * _normalize_series(stats["q95_abs_shap"])
+        0.20 * _normalize_series(stats["mean_abs_shap"])
+        + 0.12 * _normalize_series(stats["q95_abs_shap"])
+        + 0.08 * _normalize_series(stats["top10_share"])
         + 0.10 * _normalize_series(stats["top3_rate"])
-        + 0.05 * _normalize_series(stats["mean_abs_shap"])
+        + 0.10 * _normalize_series(stats["winner_rate"])
+        + 0.16 * _normalize_series(stats["focus_mean_abs_shap"])
+        + 0.08 * _normalize_series(stats["focus_q90_abs_shap"])
+        + 0.10 * _normalize_series(stats["focus_mean_share"])
+        + 0.03 * _normalize_series(stats["focus_top3_rate"])
+        + 0.03 * _normalize_series(stats["focus_winner_rate"])
     )
     stats["xai_suspicion"] = score
     return stats.sort_values("xai_suspicion", ascending=False)
@@ -235,13 +310,22 @@ def _detect_feature_fault_with_shap(
     true_feature_key: str,
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """SHAP ranking for feature-based faults using subgroup-sensitive tail behavior."""
+    """SHAP ranking for feature-based faults using a hybrid global+local score.
+
+    We intentionally use the whole offline world:
+    - train
+    - contaminated_eval
+
+    because the developer is allowed to inspect both, while clean_holdout remains hidden.
+    """
+    offline_features = pd.concat([train_features, contaminated_eval_features], axis=0)
+
     background = _build_background_sample(train_features, config)
     explainer = _build_tree_explainer(model, background)
-    shap_values = _extract_positive_class_shap_values(explainer, contaminated_eval_features)
+    shap_values = _extract_positive_class_shap_values(explainer, offline_features)
     abs_shap = np.abs(shap_values)
 
-    stats = _feature_tail_statistics(abs_shap, list(contaminated_eval_features.columns))
+    stats = _feature_hybrid_statistics(model, offline_features, abs_shap, config)
     suspect_features = stats.index.tolist()
     suspicion_scores = {feature: float(stats.loc[feature, "xai_suspicion"]) for feature in suspect_features}
 
@@ -264,28 +348,18 @@ def _detect_feature_fault_with_shap(
 
 
 def _build_clean_eval_shap_prototypes(
-    model: RandomForestClassifier,
-    train_features: pd.DataFrame,
+    explainer,
     contaminated_eval_features: pd.DataFrame,
     contaminated_eval_labels: pd.Series,
-    config: Dict[str, Any],
+    contaminated_eval_pred_proba: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Build class-specific SHAP profile prototypes from contaminated_eval.
-
-    Rationale:
-    - for label noise, train labels are corrupted
-    - contaminated_eval labels are clean in this setup
-    - therefore contaminated_eval is a fair offline reference set for 'normal' explanation profiles
-    """
-    background = _build_background_sample(train_features, config)
-    explainer = _build_tree_explainer(model, background)
+    """Build class-specific SHAP profile prototypes from contaminated_eval."""
     shap_eval = _extract_positive_class_shap_values(explainer, contaminated_eval_features)
     abs_eval = np.abs(shap_eval)
     eval_profiles = _row_normalize_abs_profiles(abs_eval)
 
-    eval_proba = model.predict_proba(contaminated_eval_features)[:, 1]
-    eval_pred = (eval_proba >= 0.5).astype(int)
-    eval_margin = np.abs(2.0 * eval_proba - 1.0)
+    eval_pred = (contaminated_eval_pred_proba >= 0.5).astype(int)
+    eval_margin = np.abs(2.0 * contaminated_eval_pred_proba - 1.0)
 
     prototypes = []
     for label in [0, 1]:
@@ -314,20 +388,28 @@ def _detect_label_noise_with_shap(
     fault_metadata: Dict[str, Any],
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Detect label noise using OOF baseline signals + SHAP profile mismatch."""
+    """Detect label noise using a two-stage strategy.
+
+    Stage 1:
+    - classical OOF ranking over all train samples
+
+    Stage 2:
+    - SHAP only reranks the strongest baseline candidates
+    - this keeps the strong baseline behavior and uses SHAP as support, not replacement
+    """
     train_features = train_split["features"]
     train_labels = train_split["labels"]
     contaminated_eval_features = contaminated_eval_split["features"]
     contaminated_eval_labels = contaminated_eval_split["labels"]
 
-    # Classical baseline part (same philosophy as baseline arm)
+    # ---------- Stage 1: strong classical baseline ranking ----------
     oof_proba_pos = _compute_oof_probabilities(train_features, train_labels, config)
     observed_labels = train_labels.to_numpy().astype(int)
     predicted_labels = (oof_proba_pos >= 0.5).astype(int)
 
     prob_observed_label = np.where(observed_labels == 1, oof_proba_pos, 1.0 - oof_proba_pos)
     disagreement = (predicted_labels != observed_labels).astype(float)
-    margins = _compute_margins_from_proba(oof_proba_pos)
+    margins = np.abs(2.0 * oof_proba_pos - 1.0)
     uncertainty = 1.0 - margins
 
     baseline_core = (
@@ -336,50 +418,73 @@ def _detect_label_noise_with_shap(
         + 0.15 * uncertainty
     )
 
-    # SHAP profile mismatch against clean contaminated_eval prototypes
-    background = _build_background_sample(train_features, config)
-    explainer = _build_tree_explainer(model, background)
-
-    shap_train = _extract_positive_class_shap_values(explainer, train_features)
-    abs_train = np.abs(shap_train)
-    train_profiles = _row_normalize_abs_profiles(abs_train)
-
-    proto_label0, proto_label1 = _build_clean_eval_shap_prototypes(
-        model,
-        train_features,
-        contaminated_eval_features,
-        contaminated_eval_labels,
-        config,
-    )
-
-    profile_mismatch = np.zeros(len(train_profiles), dtype=float)
-    for i, label in enumerate(observed_labels):
-        same_proto = proto_label1 if label == 1 else proto_label0
-        other_proto = proto_label0 if label == 1 else proto_label1
-
-        sim_same = _safe_cosine_similarity(train_profiles[i], same_proto)
-        sim_other = _safe_cosine_similarity(train_profiles[i], other_proto)
-        profile_mismatch[i] = max(0.0, sim_other - sim_same)
-
-    baseline_core_norm = _normalize_series(pd.Series(baseline_core)).to_numpy()
-    profile_mismatch_norm = _normalize_series(pd.Series(profile_mismatch)).to_numpy()
-
-    final_suspicion = (
-        float(config.get("XAI_LABEL_BASELINE_WEIGHT", 0.65)) * baseline_core_norm
-        + float(config.get("XAI_LABEL_PROFILE_WEIGHT", 0.35)) * profile_mismatch_norm
-    )
-
-    rank_positions = np.argsort(-final_suspicion)
-    ranked_index_labels = train_features.index.to_numpy()[rank_positions]
-    ranked_scores = final_suspicion[rank_positions]
-
-    suspect_indices = [int(idx) for idx in ranked_index_labels.tolist()]
-    suspect_scores = ranked_scores.tolist()
+    baseline_rank_positions = np.argsort(-baseline_core)
+    baseline_ranked_indices = train_features.index.to_numpy()[baseline_rank_positions]
 
     if "changed_indices" in fault_metadata:
         actual_noisy_indices = set(int(idx) for idx in fault_metadata["changed_indices"])
         k = len(actual_noisy_indices)
+    else:
+        actual_noisy_indices = set()
+        k = 0
 
+    rerank_multiplier = float(config.get("XAI_LABEL_CANDIDATE_MULTIPLIER", 3.0))
+    candidate_pool_size = max(40, int(np.ceil(max(1, k) * rerank_multiplier)))
+    candidate_pool_size = min(candidate_pool_size, len(train_features))
+
+    candidate_positions = baseline_rank_positions[:candidate_pool_size]
+    candidate_index_labels = train_features.index.to_numpy()[candidate_positions]
+    candidate_features = train_features.loc[candidate_index_labels]
+
+    # ---------- Stage 2: SHAP reranking on candidate pool ----------
+    background = _build_background_sample(train_features, config)
+    explainer = _build_tree_explainer(model, background)
+
+    contaminated_eval_pred_proba = model.predict_proba(contaminated_eval_features)[:, 1]
+    proto_label0, proto_label1 = _build_clean_eval_shap_prototypes(
+        explainer,
+        contaminated_eval_features,
+        contaminated_eval_labels,
+        contaminated_eval_pred_proba,
+    )
+
+    shap_candidates = _extract_positive_class_shap_values(explainer, candidate_features)
+    abs_candidates = np.abs(shap_candidates)
+    candidate_profiles = _row_normalize_abs_profiles(abs_candidates)
+
+    candidate_labels = train_labels.loc[candidate_index_labels].to_numpy().astype(int)
+    profile_mismatch = np.zeros(len(candidate_index_labels), dtype=float)
+
+    for i, label in enumerate(candidate_labels):
+        same_proto = proto_label1 if label == 1 else proto_label0
+        other_proto = proto_label0 if label == 1 else proto_label1
+
+        sim_same = _safe_cosine_similarity(candidate_profiles[i], same_proto)
+        sim_other = _safe_cosine_similarity(candidate_profiles[i], other_proto)
+        profile_mismatch[i] = max(0.0, sim_other - sim_same)
+
+    candidate_baseline = baseline_core[candidate_positions]
+    candidate_baseline_norm = _normalize_series(pd.Series(candidate_baseline)).to_numpy()
+    profile_mismatch_norm = _normalize_series(pd.Series(profile_mismatch)).to_numpy()
+
+    baseline_weight = float(config.get("XAI_LABEL_BASELINE_WEIGHT", 0.80))
+    profile_weight = float(config.get("XAI_LABEL_PROFILE_WEIGHT", 0.20))
+
+    candidate_combined = (
+        baseline_weight * candidate_baseline_norm
+        + profile_weight * profile_mismatch_norm
+    )
+
+    candidate_order = np.argsort(-candidate_combined)
+    reranked_candidate_indices = candidate_index_labels[candidate_order]
+
+    remaining_positions = baseline_rank_positions[candidate_pool_size:]
+    remaining_indices = train_features.index.to_numpy()[remaining_positions]
+
+    suspect_indices = [int(idx) for idx in reranked_candidate_indices.tolist()] + [int(idx) for idx in remaining_indices.tolist()]
+    suspect_scores = candidate_combined[candidate_order].tolist() + baseline_core[remaining_positions].tolist()
+
+    if k > 0:
         top_k_suspects = suspect_indices[:k]
         suspect_set = set(top_k_suspects)
 
@@ -387,7 +492,6 @@ def _detect_label_noise_with_shap(
         precision_at_k = float(true_positives) / float(k) if k > 0 else 0.0
         recall_at_k = float(true_positives) / float(len(actual_noisy_indices)) if len(actual_noisy_indices) > 0 else 0.0
     else:
-        k = 0
         precision_at_k = 0.0
         recall_at_k = 0.0
 
