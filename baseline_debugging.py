@@ -24,6 +24,8 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.metrics.cluster import mutual_info_score
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
+from evaluation_metrics import compute_split_metrics as shared_compute_split_metrics
+
 
 def _compute_prediction_margins(
     model: RandomForestClassifier,
@@ -361,21 +363,12 @@ def _compute_split_metrics(
     model: RandomForestClassifier,
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
 ) -> Dict[str, float]:
-    """Compute accuracy, F1, and ROC-AUC for all splits."""
-    metrics: Dict[str, float] = {}
-    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
-        split = splits[split_name]
-        features = split["features"]
-        labels = split["labels"]
+    """Compute shared metrics for all splits.
 
-        predictions = model.predict(features)
-        probabilities = model.predict_proba(features)[:, 1]
-
-        metrics[f"{split_name}_accuracy"] = float(accuracy_score(labels, predictions))
-        metrics[f"{split_name}_f1"] = float(f1_score(labels, predictions))
-        metrics[f"{split_name}_roc_auc"] = float(roc_auc_score(labels, probabilities))
-
-    return metrics
+    This delegates metric computation to evaluation_metrics.py so that
+    Baseline, XAI and Oracle repair are evaluated identically.
+    """
+    return shared_compute_split_metrics(model, splits)
 
 
 def run_baseline_debugging(

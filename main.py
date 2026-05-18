@@ -33,6 +33,16 @@ from sklearn.model_selection import train_test_split
 import faults
 import baseline_debugging
 import xai_debugging
+from evaluation_metrics import (
+    ORDERED_METRICS,
+    add_oracle_context_to_workflow_result,
+    build_method_comparison_summary,
+    compute_fix_impact,
+    compute_split_metrics as shared_compute_split_metrics,
+    delta_as_improvement_label,
+    evaluate_classifier,
+    format_delta_direction,
+)
 
 
 try:
@@ -150,14 +160,14 @@ def train_model(train_features: pd.DataFrame, train_labels: pd.Series) -> Random
 
 
 def evaluate_model(model: RandomForestClassifier, features: pd.DataFrame, labels: pd.Series) -> Dict[str, float]:
-    """Compute accuracy, F1, and ROC-AUC for a fitted classifier."""
-    predictions = model.predict(features)
-    probabilities = model.predict_proba(features)[:, 1]
-    return {
-        "accuracy": float(accuracy_score(labels, predictions)),
-        "f1": float(f1_score(labels, predictions)),
-        "roc_auc": float(roc_auc_score(labels, probabilities)),
-    }
+    """Evaluate a fitted classifier with the shared metric set.
+
+    Besides accuracy, F1 and ROC-AUC, this now also reports:
+    - balanced_accuracy
+    - log_loss
+    - brier_score
+    """
+    return evaluate_classifier(model, features, labels)
 
 
 def compute_split_metrics(
@@ -165,20 +175,20 @@ def compute_split_metrics(
     splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
 ) -> Dict[str, float]:
     """Compute flat metrics for train, contaminated_eval, and clean_holdout."""
-    metrics: Dict[str, float] = {}
-    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
-        split = splits[split_name]
-        split_metrics = evaluate_model(model, split["features"], split["labels"])
-        for metric_name, value in split_metrics.items():
-            metrics[f"{split_name}_{metric_name}"] = value
-    return metrics
+    return shared_compute_split_metrics(model, splits)
 
 
 def _print_metric_block(title: str, metrics: Dict[str, float]) -> None:
     print(title)
-    print(f"  accuracy: {metrics['accuracy']:.4f}")
-    print(f"  f1: {metrics['f1']:.4f}")
-    print(f"  roc_auc: {metrics['roc_auc']:.4f}")
+
+    for metric_name in ORDERED_METRICS:
+        if metric_name in metrics:
+            value = metrics[metric_name]
+            if value is None or not np.isfinite(float(value)):
+                formatted = "n/a"
+            else:
+                formatted = f"{float(value):.4f}"
+            print(f"  {metric_name}: {formatted}")
 
 
 # ---------------------
@@ -713,10 +723,7 @@ def run_oracle_repair(
         oracle_fix_count = 0
         oracle_fix_applied = False
 
-    fix_impact = {
-        key: metrics_after.get(key, 0.0) - metrics_before.get(key, 0.0)
-        for key in metrics_before.keys()
-    }
+    fix_impact = compute_fix_impact(metrics_before, metrics_after)
 
     return {
         "workflow": "oracle_true_fix",
@@ -736,21 +743,100 @@ def run_oracle_repair(
 # ---------------------
 # Printing
 # ---------------------
+def _format_metric_value(value: float | None) -> str:
+    """Format metric values safely for printing."""
+    if value is None:
+        return "n/a"
+
+    try:
+        number = float(value)
+    except Exception:
+        return "n/a"
+
+    if not np.isfinite(number):
+        return "n/a"
+
+    return f"{number:.4f}"
+
+
+def _print_split_metrics_from_flat_dict(
+    metrics: Dict[str, float],
+    split_name: str,
+) -> None:
+    """Print all metrics for one split from a flat metric dictionary."""
+    pieces = []
+
+    for metric_name in ORDERED_METRICS:
+        full_name = f"{split_name}_{metric_name}"
+        if full_name in metrics:
+            pieces.append(f"{metric_name}={_format_metric_value(metrics[full_name])}")
+
+    print(f"  {split_name}: " + ", ".join(pieces))
+
+
+def _print_fix_impact(fix_impact: Dict[str, float]) -> None:
+    """Print fix impact with correct improvement direction.
+
+    Important:
+    - For accuracy/F1/AUC: higher is better.
+    - For log_loss/Brier: lower is better.
+    """
+    for metric_name, delta in fix_impact.items():
+        direction = format_delta_direction(metric_name, float(delta))
+        label = delta_as_improvement_label(metric_name, float(delta))
+        print(f"  {metric_name}: {float(delta):+.4f} ({direction}, {label})")
+
+
+def _print_oracle_normalized_repair(result: Dict[str, Any]) -> None:
+    """Print oracle-normalized repair information if available."""
+    normalized = result.get("oracle_normalized_repair", {})
+    if not normalized:
+        return
+
+    print("\nOracle-normalized repair impact:")
+    print("  Interpretation: 1.0 = same improvement as perfect oracle fix; 0.0 = no useful repair effect.")
+
+    for metric_name, values in normalized.items():
+        normalized_value = values.get("oracle_normalized_value")
+        workflow_improvement = values.get("workflow_improvement")
+        oracle_improvement = values.get("oracle_improvement")
+
+        if normalized_value is None:
+            normalized_text = "n/a (oracle effect too small)"
+        else:
+            normalized_text = f"{float(normalized_value):.4f}"
+
+        print(
+            f"  {metric_name}: normalized={normalized_text}, "
+            f"workflow_improvement={_format_metric_value(workflow_improvement)}, "
+            f"oracle_improvement={_format_metric_value(oracle_improvement)}"
+        )
+
+    if "repair_effect_quality" in result:
+        print(f"  repair_effect_quality: {result['repair_effect_quality']}")
+        print(f"  repair_effect_reason: {result.get('repair_effect_reason', 'n/a')}")
+
+
 def _print_debugging_result(title: str, result: Dict[str, Any], fault_type: str) -> None:
     print(f"\n{'*' * 70}")
     print(title)
     print(f"{'*' * 70}")
 
     print(f"\nDetection steps: {result.get('steps_to_detect')}")
-    print(f"MRR: {result.get('mrr', 0.0):.4f}")
-    print(f"Hit@1: {result.get('hit_at_1', 0)} | Hit@3: {result.get('hit_at_3', 0)} | Hit@5: {result.get('hit_at_5', 0)} | Hit@10: {result.get('hit_at_10', 0)}")
+    print(f"MRR: {_format_metric_value(result.get('mrr', 0.0))}")
+    print(
+        f"Hit@1: {result.get('hit_at_1', 0)} | "
+        f"Hit@3: {result.get('hit_at_3', 0)} | "
+        f"Hit@5: {result.get('hit_at_5', 0)} | "
+        f"Hit@10: {result.get('hit_at_10', 0)}"
+    )
     print(f"Retrains: {result['retrains']}")
     print(f"Runtime: {result['runtime_sec']:.3f} seconds")
 
     if fault_type == "label_noise":
         print("\nLabel Noise Detection:")
-        print(f"  Precision@k: {result.get('precision_at_k', 0.0):.4f}")
-        print(f"  Recall@k: {result.get('recall_at_k', 0.0):.4f}")
+        print(f"  Precision@k: {_format_metric_value(result.get('precision_at_k', 0.0))}")
+        print(f"  Recall@k: {_format_metric_value(result.get('recall_at_k', 0.0))}")
         print(f"  First true label rank: {result.get('first_true_label_rank', -1)}")
         print(f"  Top suspect indices: {result.get('suspect_indices', [])[:5]}")
 
@@ -770,22 +856,16 @@ def _print_debugging_result(title: str, result: Dict[str, Any], fault_type: str)
 
     print("\nMetrics before fix:")
     for split_name in ["train", "contaminated_eval", "clean_holdout"]:
-        acc = result["metrics_before"].get(f"{split_name}_accuracy", 0.0)
-        f1 = result["metrics_before"].get(f"{split_name}_f1", 0.0)
-        auc = result["metrics_before"].get(f"{split_name}_roc_auc", 0.0)
-        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
+        _print_split_metrics_from_flat_dict(result["metrics_before"], split_name)
 
     print("\nMetrics after fix:")
     for split_name in ["train", "contaminated_eval", "clean_holdout"]:
-        acc = result["metrics_after"].get(f"{split_name}_accuracy", 0.0)
-        f1 = result["metrics_after"].get(f"{split_name}_f1", 0.0)
-        auc = result["metrics_after"].get(f"{split_name}_roc_auc", 0.0)
-        print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
+        _print_split_metrics_from_flat_dict(result["metrics_after"], split_name)
 
     print("\nFix impact (delta):")
-    for metric_name, delta in result["fix_impact"].items():
-        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
-        print(f"  {metric_name}: {delta:+.4f} {direction}")
+    _print_fix_impact(result["fix_impact"])
+
+    _print_oracle_normalized_repair(result)
 
 
 def _print_oracle_result(result: Dict[str, Any]) -> None:
@@ -799,9 +879,44 @@ def _print_oracle_result(result: Dict[str, Any]) -> None:
     print(f"Runtime: {result['runtime_sec']:.3f} seconds")
 
     print("\nOracle fix impact (delta):")
-    for metric_name, delta in result["fix_impact"].items():
-        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
-        print(f"  {metric_name}: {delta:+.4f} {direction}")
+    _print_fix_impact(result["fix_impact"])
+
+
+def _print_method_comparison_summary(summary: Dict[str, Any]) -> None:
+    """Print compact Baseline-vs-XAI comparison summary."""
+    print(f"\n{'*' * 70}")
+    print("BASELINE VS. XAI SUMMARY")
+    print(f"{'*' * 70}")
+
+    print("\nLocalization:")
+    print(f"  Baseline steps_to_detect: {summary.get('baseline_steps_to_detect')}")
+    print(f"  XAI steps_to_detect: {summary.get('xai_steps_to_detect')}")
+    print(f"  Steps saved by XAI: {summary.get('steps_saved_by_xai')}")
+    print(f"  Baseline MRR: {_format_metric_value(summary.get('baseline_mrr'))}")
+    print(f"  XAI MRR: {_format_metric_value(summary.get('xai_mrr'))}")
+    print(f"  MRR delta XAI - Baseline: {_format_metric_value(summary.get('mrr_delta_xai_minus_baseline'))}")
+    print(f"  Hit@10 delta XAI - Baseline: {summary.get('hit_at_10_delta_xai_minus_baseline')}")
+
+    if summary.get("baseline_precision_at_k") is not None:
+        print("\nLabel-noise top-k quality:")
+        print(f"  Baseline Precision@k: {_format_metric_value(summary.get('baseline_precision_at_k'))}")
+        print(f"  XAI Precision@k: {_format_metric_value(summary.get('xai_precision_at_k'))}")
+        print(
+            "  Precision@k delta XAI - Baseline: "
+            f"{_format_metric_value(summary.get('precision_at_k_delta_xai_minus_baseline'))}"
+        )
+
+    print("\nRuntime:")
+    print(f"  Baseline runtime: {_format_metric_value(summary.get('baseline_runtime_sec'))} sec")
+    print(f"  XAI runtime: {_format_metric_value(summary.get('xai_runtime_sec'))} sec")
+    print(f"  XAI overhead: {_format_metric_value(summary.get('xai_runtime_overhead_sec'))} sec")
+    print(f"  XAI runtime ratio: {_format_metric_value(summary.get('xai_runtime_ratio'))}")
+
+    oracle_quality = summary.get("oracle_repair_quality", {})
+    print("\nOracle repair potential:")
+    print(f"  Quality: {oracle_quality.get('repair_effect_quality')}")
+    print(f"  Reason: {oracle_quality.get('reason')}")
+    print(f"  Max clean-holdout improvement: {_format_metric_value(oracle_quality.get('max_clean_holdout_improvement'))}")
 
 
 # ---------------------
@@ -859,6 +974,14 @@ def _row_from_result(
         "oracle_target": workflow_result.get("oracle_target"),
         "oracle_fix_applied": workflow_result.get("oracle_fix_applied"),
         "oracle_fix_count": workflow_result.get("oracle_fix_count"),
+        "repair_effect_quality": workflow_result.get("repair_effect_quality"),
+        "repair_effect_reason": workflow_result.get("repair_effect_reason"),
+        "oracle_normalized_clean_holdout_accuracy": workflow_result.get("oracle_normalized_clean_holdout_accuracy"),
+        "oracle_normalized_clean_holdout_balanced_accuracy": workflow_result.get("oracle_normalized_clean_holdout_balanced_accuracy"),
+        "oracle_normalized_clean_holdout_f1": workflow_result.get("oracle_normalized_clean_holdout_f1"),
+        "oracle_normalized_clean_holdout_roc_auc": workflow_result.get("oracle_normalized_clean_holdout_roc_auc"),
+        "oracle_normalized_clean_holdout_log_loss": workflow_result.get("oracle_normalized_clean_holdout_log_loss"),
+        "oracle_normalized_clean_holdout_brier_score": workflow_result.get("oracle_normalized_clean_holdout_brier_score"),
     }
 
     for metric_name, value in workflow_result.get("metrics_before", {}).items():
@@ -1010,7 +1133,6 @@ def run_single_experiment(
         FAULT_TYPE,
         fault_metadata,
     )
-    _print_debugging_result("BASELINE DEBUGGING (NO XAI)", baseline_result, FAULT_TYPE)
 
     xai_result_raw = xai_debugging.run_xai_debugging(
         model=model,
@@ -1024,7 +1146,6 @@ def run_single_experiment(
         FAULT_TYPE,
         fault_metadata,
     )
-    _print_debugging_result("XAI DEBUGGING (SHAP)", xai_result, FAULT_TYPE)
 
     oracle_result = run_oracle_repair(
         model=model,
@@ -1032,7 +1153,27 @@ def run_single_experiment(
         fault_metadata=fault_metadata,
         injected_splits=injected_splits,
     )
+
+    # Add oracle-normalized repair interpretation after oracle is available.
+    baseline_result = add_oracle_context_to_workflow_result(
+        baseline_result,
+        oracle_result,
+    )
+    xai_result = add_oracle_context_to_workflow_result(
+        xai_result,
+        oracle_result,
+    )
+
+    method_comparison_summary = build_method_comparison_summary(
+        baseline_result=baseline_result,
+        xai_result=xai_result,
+        oracle_result=oracle_result,
+    )
+
+    _print_debugging_result("BASELINE DEBUGGING (NO XAI)", baseline_result, FAULT_TYPE)
+    _print_debugging_result("XAI DEBUGGING (SHAP)", xai_result, FAULT_TYPE)
     _print_oracle_result(oracle_result)
+    _print_method_comparison_summary(method_comparison_summary)
 
     output_rows = build_output_rows(
         seed=RANDOM_STATE,
@@ -1058,6 +1199,7 @@ def run_single_experiment(
         "baseline_debugging_result": baseline_result,
         "xai_debugging_result": xai_result,
         "oracle_repair_result": oracle_result,
+        "method_comparison_summary": method_comparison_summary,
         "csv_rows": output_rows,
     }
 
