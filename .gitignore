@@ -1,6 +1,7 @@
 /.venv
 log.md
 /__pycache__
+/results
 
 *.sh
 code_*.txt

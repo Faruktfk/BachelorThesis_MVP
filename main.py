@@ -1,18 +1,27 @@
 """Main orchestration for fault-injection ML pipeline testing.
 
-This module provides experiment setup, training, evaluation, and diagnostics.
-Fault-injection logic is delegated to faults.py module.
+This module provides:
+- dataset loading and three-way splitting
+- fault injection via faults.py
+- model training and evaluation
+- baseline debugging
+- SHAP/XAI debugging
+- oracle repair evaluation
+- CSV/JSONL-ready experiment output
+
+Important methodological distinction:
+- baseline_debugging and xai_debugging simulate the developer view.
+- oracle repair and clean_holdout evaluation are experimentator-only post-hoc analysis.
 """
 
 from __future__ import annotations
 
-import sys
-sys.stdout.reconfigure(encoding="utf-8")
-
-
 import argparse
 import json
-from typing import Any, Dict, Tuple
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -24,6 +33,12 @@ from sklearn.model_selection import train_test_split
 import faults
 import baseline_debugging
 import xai_debugging
+
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 
 # ---------------------
@@ -89,6 +104,9 @@ XAI_FEATURE_FOCUS_FRACTION = 0.20
 ENABLE_FAULT_SANITY_CHECKS = True
 
 
+# ---------------------
+# Basic setup
+# ---------------------
 def load_dataset() -> Tuple[pd.DataFrame, pd.Series]:
     """Load the Breast Cancer dataset as tabular features and binary labels."""
     dataset = load_breast_cancer(as_frame=True)
@@ -122,8 +140,11 @@ def split_dataset(features: pd.DataFrame, labels: pd.Series) -> Dict[str, Dict[s
 
 
 def train_model(train_features: pd.DataFrame, train_labels: pd.Series) -> RandomForestClassifier:
-    """Train a RandomForestClassifier on the injected training split."""
-    model = RandomForestClassifier(n_estimators=N_ESTIMATORS, random_state=RANDOM_STATE)
+    """Train a RandomForestClassifier on the given training split."""
+    model = RandomForestClassifier(
+        n_estimators=N_ESTIMATORS,
+        random_state=RANDOM_STATE,
+    )
     model.fit(train_features, train_labels)
     return model
 
@@ -139,6 +160,20 @@ def evaluate_model(model: RandomForestClassifier, features: pd.DataFrame, labels
     }
 
 
+def compute_split_metrics(
+    model: RandomForestClassifier,
+    splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
+) -> Dict[str, float]:
+    """Compute flat metrics for train, contaminated_eval, and clean_holdout."""
+    metrics: Dict[str, float] = {}
+    for split_name in ["train", "contaminated_eval", "clean_holdout"]:
+        split = splits[split_name]
+        split_metrics = evaluate_model(model, split["features"], split["labels"])
+        for metric_name, value in split_metrics.items():
+            metrics[f"{split_name}_{metric_name}"] = value
+    return metrics
+
+
 def _print_metric_block(title: str, metrics: Dict[str, float]) -> None:
     print(title)
     print(f"  accuracy: {metrics['accuracy']:.4f}")
@@ -146,6 +181,9 @@ def _print_metric_block(title: str, metrics: Dict[str, float]) -> None:
     print(f"  roc_auc: {metrics['roc_auc']:.4f}")
 
 
+# ---------------------
+# Fault quality checks
+# ---------------------
 def _quality_label_noise(
     train_metrics: Dict[str, float],
     contaminated_eval_metrics: Dict[str, float],
@@ -238,7 +276,12 @@ def assess_fault_quality(
     diagnostics: Dict[str, Dict[str, float]],
 ) -> Dict[str, str]:
     if fault_type == "label_noise":
-        quality, reason = _quality_label_noise(train_metrics, contaminated_eval_metrics, clean_holdout_metrics, fault_metadata)
+        quality, reason = _quality_label_noise(
+            train_metrics,
+            contaminated_eval_metrics,
+            clean_holdout_metrics,
+            fault_metadata,
+        )
     elif fault_type == "data_leakage":
         quality, reason = _quality_leakage(
             contaminated_eval_metrics,
@@ -278,6 +321,7 @@ def print_fault_diagnostics(
     print(f"contaminated_eval -> clean_holdout accuracy gap: {contaminated_eval_metrics['accuracy'] - clean_holdout_metrics['accuracy']:.4f}")
 
     diagnostics: Dict[str, Dict[str, float]] = {}
+
     if fault_type == "label_noise":
         print(f"Label noise mode: {fault_metadata.get('noise_mode')}")
         print(f"Changed labels: {fault_metadata.get('changed_count')}")
@@ -292,6 +336,7 @@ def print_fault_diagnostics(
             diagnostics,
         )
         print(f"Fault quality: {quality_report['quality']} - {quality_report['reason']}")
+
     elif fault_type == "data_leakage":
         feature_name = fault_metadata.get("leakage_feature_name")
         if feature_name:
@@ -314,6 +359,7 @@ def print_fault_diagnostics(
             )
             print(f"Leakage assessment: {quality_report['quality']} - {quality_report['reason']}")
             print(f"Fault quality: {quality_report['quality']} - {quality_report['reason']}")
+
     elif fault_type == "spurious_correlation":
         feature_name = fault_metadata.get("feature_name")
         if feature_name:
@@ -336,14 +382,15 @@ def print_fault_diagnostics(
                 diagnostics,
             )
             print(f"Fault quality: {quality_report['quality']} - {quality_report['reason']}")
+
     print("--- End Sanity Check ---\n")
 
 
-def apply_fault_injection(
-    splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
-) -> Tuple[Dict[str, Dict[str, pd.DataFrame | pd.Series]], Dict[str, Any]]:
-    """Apply fault injection using faults module with config dictionary."""
-    config = {
+# ---------------------
+# Fault injection
+# ---------------------
+def build_fault_config() -> Dict[str, Any]:
+    return {
         "RANDOM_STATE": RANDOM_STATE,
         "LABEL_NOISE_RATE": LABEL_NOISE_RATE,
         "LABEL_NOISE_MODE": LABEL_NOISE_MODE,
@@ -373,6 +420,13 @@ def apply_fault_injection(
         "INVERTED_SIGNAL_WEIGHT": INVERTED_SIGNAL_WEIGHT,
         "INVERTED_NOISE_STD": INVERTED_NOISE_STD,
     }
+
+
+def apply_fault_injection(
+    splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
+) -> Tuple[Dict[str, Dict[str, pd.DataFrame | pd.Series]], Dict[str, Any]]:
+    """Apply fault injection using faults.py with config dictionary."""
+    config = build_fault_config()
 
     if FAULT_TYPE == "label_noise":
         noisy_train_labels, metadata = faults._inject_label_noise(
@@ -413,62 +467,481 @@ def apply_fault_injection(
     return splits, metadata
 
 
-def _print_debugging_result(title: str, result: Dict[str, Any], fault_type: str) -> None:
-    print(f"\n{'*'*70}")
-    print(title)
-    print(f"{'*'*70}")
+# ---------------------
+# New: true detection metrics
+# ---------------------
+def _get_true_feature_name(fault_type: str, fault_metadata: Dict[str, Any]) -> str | None:
+    if fault_type == "data_leakage":
+        return fault_metadata.get("leakage_feature_name")
+    if fault_type == "spurious_correlation":
+        return fault_metadata.get("feature_name")
+    return None
 
-    print(f"\nDetection steps: {result['steps_to_detect']}")
+
+def _compute_feature_detection_metrics(
+    result: Dict[str, Any],
+    true_feature: str | None,
+) -> Dict[str, Any]:
+    suspect_features = result.get("suspect_features", []) or []
+
+    if true_feature is None:
+        rank = -1
+    else:
+        try:
+            rank = suspect_features.index(true_feature) + 1
+        except ValueError:
+            rank = -1
+
+    if rank > 0:
+        mrr = 1.0 / float(rank)
+        hit_at_1 = 1 if rank <= 1 else 0
+        hit_at_3 = 1 if rank <= 3 else 0
+        hit_at_5 = 1 if rank <= 5 else 0
+        hit_at_10 = 1 if rank <= 10 else 0
+        steps_to_detect = rank
+    else:
+        mrr = 0.0
+        hit_at_1 = 0
+        hit_at_3 = 0
+        hit_at_5 = 0
+        hit_at_10 = 0
+        steps_to_detect = -1
+
+    return {
+        "true_feature": true_feature,
+        "rank_true_feature": rank,
+        "steps_to_detect": steps_to_detect,
+        "hit_at_1": hit_at_1,
+        "hit_at_3": hit_at_3,
+        "hit_at_5": hit_at_5,
+        "hit_at_10": hit_at_10,
+        "mrr": mrr,
+    }
+
+
+def _compute_label_noise_detection_metrics(
+    result: Dict[str, Any],
+    fault_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    suspect_indices = [int(idx) for idx in result.get("suspect_indices", [])]
+    true_indices = set(int(idx) for idx in fault_metadata.get("changed_indices", []))
+
+    if not true_indices:
+        return {
+            "first_true_label_rank": -1,
+            "steps_to_detect": -1,
+            "hit_at_1": 0,
+            "hit_at_3": 0,
+            "hit_at_5": 0,
+            "hit_at_10": 0,
+            "mrr": 0.0,
+        }
+
+    first_rank = -1
+    for position, idx in enumerate(suspect_indices, start=1):
+        if idx in true_indices:
+            first_rank = position
+            break
+
+    if first_rank > 0:
+        mrr = 1.0 / float(first_rank)
+    else:
+        mrr = 0.0
+
+    return {
+        "first_true_label_rank": first_rank,
+        "steps_to_detect": first_rank,
+        "hit_at_1": 1 if 0 < first_rank <= 1 else 0,
+        "hit_at_3": 1 if 0 < first_rank <= 3 else 0,
+        "hit_at_5": 1 if 0 < first_rank <= 5 else 0,
+        "hit_at_10": 1 if 0 < first_rank <= 10 else 0,
+        "mrr": mrr,
+    }
+
+
+def enrich_debugging_result(
+    result: Dict[str, Any],
+    fault_type: str,
+    fault_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Replace placeholder steps_to_detect with real detection metrics.
+
+    Feature faults:
+    - steps_to_detect = rank of true fault feature
+
+    Label noise:
+    - steps_to_detect = first rank at which a truly corrupted label appears
+    - precision@k and recall@k still measure broader top-k quality
+    """
+    enriched = dict(result)
+
+    if fault_type in ("data_leakage", "spurious_correlation"):
+        true_feature = _get_true_feature_name(fault_type, fault_metadata)
+        enriched.update(_compute_feature_detection_metrics(enriched, true_feature))
+
+    elif fault_type == "label_noise":
+        enriched.update(_compute_label_noise_detection_metrics(enriched, fault_metadata))
+
+    else:
+        enriched["steps_to_detect"] = 0
+        enriched["hit_at_1"] = 0
+        enriched["hit_at_3"] = 0
+        enriched["hit_at_5"] = 0
+        enriched["hit_at_10"] = 0
+        enriched["mrr"] = 0.0
+
+    return enriched
+
+
+# ---------------------
+# New: oracle repair
+# ---------------------
+def _drop_feature_from_splits(
+    splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
+    feature_name: str,
+) -> Dict[str, Dict[str, pd.DataFrame | pd.Series]]:
+    fixed_splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]] = {}
+
+    for split_name, split_data in splits.items():
+        features = split_data["features"]
+        labels = split_data["labels"]
+
+        if feature_name in features.columns:
+            fixed_features = features.drop(columns=[feature_name])
+        else:
+            fixed_features = features.copy()
+
+        fixed_splits[split_name] = {
+            "features": fixed_features,
+            "labels": labels,
+        }
+
+    return fixed_splits
+
+
+def _apply_oracle_label_fix(
+    splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
+    fault_metadata: Dict[str, Any],
+) -> Tuple[Dict[str, Dict[str, pd.DataFrame | pd.Series]], List[int]]:
+    fixed_labels = splits["train"]["labels"].copy()
+    corrected_indices: List[int] = []
+
+    original_labels = {
+        int(idx): int(label)
+        for idx, label in fault_metadata.get("original_labels_by_index", {}).items()
+    }
+
+    for idx, original_label in original_labels.items():
+        if idx in fixed_labels.index:
+            fixed_labels.loc[idx] = original_label
+            corrected_indices.append(idx)
+
+    fixed_splits = {
+        "train": {
+            "features": splits["train"]["features"],
+            "labels": fixed_labels,
+        },
+        "contaminated_eval": splits["contaminated_eval"],
+        "clean_holdout": splits["clean_holdout"],
+    }
+
+    return fixed_splits, corrected_indices
+
+
+def run_oracle_repair(
+    model: RandomForestClassifier,
+    fault_type: str,
+    fault_metadata: Dict[str, Any],
+    injected_splits: Dict[str, Dict[str, pd.DataFrame | pd.Series]],
+) -> Dict[str, Any]:
+    """Experimentator-only oracle repair.
+
+    This is NOT a developer workflow.
+    It answers: what would happen if the true injected root cause were fixed perfectly?
+
+    Use this to separate:
+    - localization quality
+    - workflow repair quality
+    - theoretical repair potential
+    """
+    start_time = time.time()
+    metrics_before = compute_split_metrics(model, injected_splits)
+
+    if fault_type == "none":
+        metrics_after = metrics_before
+        fix_impact = {key: 0.0 for key in metrics_before.keys()}
+        return {
+            "workflow": "oracle_true_fix",
+            "fault_type": fault_type,
+            "oracle_target": None,
+            "oracle_fix_applied": False,
+            "oracle_fix_count": 0,
+            "metrics_before": metrics_before,
+            "metrics_after": metrics_after,
+            "fix_impact": fix_impact,
+            "steps_to_detect": 0,
+            "retrains": 0,
+            "runtime_sec": float(time.time() - start_time),
+        }
+
+    if fault_type == "label_noise":
+        fixed_splits, corrected_indices = _apply_oracle_label_fix(injected_splits, fault_metadata)
+        retrained_model = train_model(fixed_splits["train"]["features"], fixed_splits["train"]["labels"])
+        metrics_after = compute_split_metrics(retrained_model, fixed_splits)
+        oracle_target = "all_true_noisy_labels"
+        oracle_fix_count = len(corrected_indices)
+        oracle_fix_applied = oracle_fix_count > 0
+
+    elif fault_type in ("data_leakage", "spurious_correlation"):
+        true_feature = _get_true_feature_name(fault_type, fault_metadata)
+        if true_feature is None:
+            metrics_after = metrics_before
+            oracle_target = None
+            oracle_fix_count = 0
+            oracle_fix_applied = False
+        else:
+            fixed_splits = _drop_feature_from_splits(injected_splits, true_feature)
+            retrained_model = train_model(fixed_splits["train"]["features"], fixed_splits["train"]["labels"])
+            metrics_after = compute_split_metrics(retrained_model, fixed_splits)
+            oracle_target = true_feature
+            oracle_fix_count = 1
+            oracle_fix_applied = True
+
+    else:
+        metrics_after = metrics_before
+        oracle_target = None
+        oracle_fix_count = 0
+        oracle_fix_applied = False
+
+    fix_impact = {
+        key: metrics_after.get(key, 0.0) - metrics_before.get(key, 0.0)
+        for key in metrics_before.keys()
+    }
+
+    return {
+        "workflow": "oracle_true_fix",
+        "fault_type": fault_type,
+        "oracle_target": oracle_target,
+        "oracle_fix_applied": oracle_fix_applied,
+        "oracle_fix_count": oracle_fix_count,
+        "metrics_before": metrics_before,
+        "metrics_after": metrics_after,
+        "fix_impact": fix_impact,
+        "steps_to_detect": 0,
+        "retrains": 1 if oracle_fix_applied else 0,
+        "runtime_sec": float(time.time() - start_time),
+    }
+
+
+# ---------------------
+# Printing
+# ---------------------
+def _print_debugging_result(title: str, result: Dict[str, Any], fault_type: str) -> None:
+    print(f"\n{'*' * 70}")
+    print(title)
+    print(f"{'*' * 70}")
+
+    print(f"\nDetection steps: {result.get('steps_to_detect')}")
+    print(f"MRR: {result.get('mrr', 0.0):.4f}")
+    print(f"Hit@1: {result.get('hit_at_1', 0)} | Hit@3: {result.get('hit_at_3', 0)} | Hit@5: {result.get('hit_at_5', 0)} | Hit@10: {result.get('hit_at_10', 0)}")
     print(f"Retrains: {result['retrains']}")
     print(f"Runtime: {result['runtime_sec']:.3f} seconds")
 
     if fault_type == "label_noise":
-        print(f"\nLabel Noise Detection:")
+        print("\nLabel Noise Detection:")
         print(f"  Precision@k: {result.get('precision_at_k', 0.0):.4f}")
         print(f"  Recall@k: {result.get('recall_at_k', 0.0):.4f}")
+        print(f"  First true label rank: {result.get('first_true_label_rank', -1)}")
         print(f"  Top suspect indices: {result.get('suspect_indices', [])[:5]}")
 
     elif fault_type == "data_leakage":
-        print(f"\nData Leakage Detection:")
+        print("\nData Leakage Detection:")
+        print(f"  True feature: {result.get('true_feature')}")
         print(f"  Rank of true feature: {result.get('rank_true_feature', -1)}")
         print(f"  Top candidate feature: {result.get('top_candidate_feature')}")
         print(f"  Top-5 suspect features: {result.get('suspect_features', [])[:5]}")
 
     elif fault_type == "spurious_correlation":
-        print(f"\nSpurious Correlation Detection:")
+        print("\nSpurious Correlation Detection:")
+        print(f"  True feature: {result.get('true_feature')}")
         print(f"  Rank of true feature: {result.get('rank_true_feature', -1)}")
         print(f"  Top candidate feature: {result.get('top_candidate_feature')}")
         print(f"  Top-5 suspect features: {result.get('suspect_features', [])[:5]}")
 
-    print(f"\nMetrics before fix:")
+    print("\nMetrics before fix:")
     for split_name in ["train", "contaminated_eval", "clean_holdout"]:
         acc = result["metrics_before"].get(f"{split_name}_accuracy", 0.0)
         f1 = result["metrics_before"].get(f"{split_name}_f1", 0.0)
         auc = result["metrics_before"].get(f"{split_name}_roc_auc", 0.0)
         print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
 
-    print(f"\nMetrics after fix:")
+    print("\nMetrics after fix:")
     for split_name in ["train", "contaminated_eval", "clean_holdout"]:
         acc = result["metrics_after"].get(f"{split_name}_accuracy", 0.0)
         f1 = result["metrics_after"].get(f"{split_name}_f1", 0.0)
         auc = result["metrics_after"].get(f"{split_name}_roc_auc", 0.0)
         print(f"  {split_name}: accuracy={acc:.4f}, f1={f1:.4f}, roc_auc={auc:.4f}")
 
-    print(f"\nFix impact (delta):")
+    print("\nFix impact (delta):")
     for metric_name, delta in result["fix_impact"].items():
         direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
         print(f"  {metric_name}: {delta:+.4f} {direction}")
 
 
-def main() -> Dict[str, Any]:
-    """Run the full reproducible training and fault-injection workflow with baseline + XAI debugging."""
+def _print_oracle_result(result: Dict[str, Any]) -> None:
+    print(f"\n{'*' * 70}")
+    print("ORACLE REPAIR (EXPERIMENTATOR ONLY)")
+    print(f"{'*' * 70}")
+
+    print(f"\nOracle target: {result.get('oracle_target')}")
+    print(f"Oracle fix applied: {result.get('oracle_fix_applied')}")
+    print(f"Oracle fix count: {result.get('oracle_fix_count')}")
+    print(f"Runtime: {result['runtime_sec']:.3f} seconds")
+
+    print("\nOracle fix impact (delta):")
+    for metric_name, delta in result["fix_impact"].items():
+        direction = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+        print(f"  {metric_name}: {delta:+.4f} {direction}")
+
+
+# ---------------------
+# CSV / JSONL output
+# ---------------------
+def _current_mode_label() -> str:
+    if FAULT_TYPE == "label_noise":
+        return LABEL_NOISE_MODE
+    if FAULT_TYPE == "data_leakage":
+        return LEAKAGE_MODE
+    if FAULT_TYPE == "spurious_correlation":
+        return SPURIOUS_MODE
+    return "none"
+
+
+def _safe_json_value(value: Any) -> Any:
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, pd.Series):
+        return value.to_dict()
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict(orient="records")
+    return str(value)
+
+
+def _row_from_result(
+    workflow_result: Dict[str, Any],
+    seed: int,
+    fault_type: str,
+    fault_mode: str,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "seed": seed,
+        "fault_type": fault_type,
+        "fault_mode": fault_mode,
+        "workflow": workflow_result.get("workflow"),
+        "runtime_sec": workflow_result.get("runtime_sec"),
+        "retrains": workflow_result.get("retrains"),
+        "steps_to_detect": workflow_result.get("steps_to_detect"),
+        "mrr": workflow_result.get("mrr"),
+        "hit_at_1": workflow_result.get("hit_at_1"),
+        "hit_at_3": workflow_result.get("hit_at_3"),
+        "hit_at_5": workflow_result.get("hit_at_5"),
+        "hit_at_10": workflow_result.get("hit_at_10"),
+        "precision_at_k": workflow_result.get("precision_at_k"),
+        "recall_at_k": workflow_result.get("recall_at_k"),
+        "first_true_label_rank": workflow_result.get("first_true_label_rank"),
+        "rank_true_feature": workflow_result.get("rank_true_feature"),
+        "true_feature": workflow_result.get("true_feature"),
+        "top_candidate_feature": workflow_result.get("top_candidate_feature"),
+        "oracle_target": workflow_result.get("oracle_target"),
+        "oracle_fix_applied": workflow_result.get("oracle_fix_applied"),
+        "oracle_fix_count": workflow_result.get("oracle_fix_count"),
+    }
+
+    for metric_name, value in workflow_result.get("metrics_before", {}).items():
+        row[f"before_{metric_name}"] = value
+
+    for metric_name, value in workflow_result.get("metrics_after", {}).items():
+        row[f"after_{metric_name}"] = value
+
+    for metric_name, value in workflow_result.get("fix_impact", {}).items():
+        row[f"delta_{metric_name}"] = value
+
+    suspect_features = workflow_result.get("suspect_features")
+    if suspect_features is not None:
+        row["top5_suspect_features"] = json.dumps(suspect_features[:5], ensure_ascii=False)
+
+    suspect_indices = workflow_result.get("suspect_indices")
+    if suspect_indices is not None:
+        row["top5_suspect_indices"] = json.dumps(suspect_indices[:5], ensure_ascii=False)
+
+    return row
+
+
+def build_output_rows(
+    seed: int,
+    fault_type: str,
+    fault_mode: str,
+    baseline_result: Dict[str, Any],
+    xai_result: Dict[str, Any],
+    oracle_result: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    return [
+        _row_from_result(baseline_result, seed, fault_type, fault_mode),
+        _row_from_result(xai_result, seed, fault_type, fault_mode),
+        _row_from_result(oracle_result, seed, fault_type, fault_mode),
+    ]
+
+
+def append_rows_to_csv(rows: List[Dict[str, Any]], output_csv: str | None) -> None:
+    if not output_csv:
+        return
+
+    output_path = Path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame(rows)
+    write_header = not output_path.exists()
+    df.to_csv(output_path, mode="a", header=write_header, index=False, encoding="utf-8")
+
+
+def append_result_to_jsonl(result: Dict[str, Any], output_jsonl: str | None) -> None:
+    if not output_jsonl:
+        return
+
+    output_path = Path(output_jsonl)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(result, ensure_ascii=False, default=_safe_json_value))
+        file.write("\n")
+
+
+# ---------------------
+# Main
+# ---------------------
+def run_single_experiment(
+    output_csv: str | None = None,
+    output_jsonl: str | None = None,
+) -> Dict[str, Any]:
+    """Run one experiment configuration and optionally append CSV/JSONL outputs."""
     features, labels = load_dataset()
     splits = split_dataset(features, labels)
     injected_splits, fault_metadata = apply_fault_injection(splits)
 
-    model = train_model(injected_splits["train"]["features"], injected_splits["train"]["labels"])
+    model = train_model(
+        injected_splits["train"]["features"],
+        injected_splits["train"]["labels"],
+    )
 
-    train_metrics = evaluate_model(model, injected_splits["train"]["features"], injected_splits["train"]["labels"])
+    train_metrics = evaluate_model(
+        model,
+        injected_splits["train"]["features"],
+        injected_splits["train"]["labels"],
+    )
     contaminated_eval_metrics = evaluate_model(
         model,
         injected_splits["contaminated_eval"]["features"],
@@ -480,12 +953,15 @@ def main() -> Dict[str, Any]:
         injected_splits["clean_holdout"]["labels"],
     )
 
-    print(f"\n{'*'*70}")
+    print(f"\n{'*' * 70}")
     print("FAULT INJECTION & INITIAL TRAINING")
-    print(f"{'*'*70}")
+    print(f"{'*' * 70}")
     print(f"Active fault type: {FAULT_TYPE}")
+    print(f"Active fault mode: {_current_mode_label()}")
+    print(f"Seed: {RANDOM_STATE}")
     print("\nFault metadata:")
     print(json.dumps(fault_metadata, indent=2, ensure_ascii=False))
+
     _print_metric_block("\nTrain metrics:", train_metrics)
     _print_metric_block("Contaminated eval metrics:", contaminated_eval_metrics)
     _print_metric_block("Clean holdout metrics:", clean_holdout_metrics)
@@ -522,26 +998,57 @@ def main() -> Dict[str, Any]:
         "XAI_FEATURE_FOCUS_FRACTION": XAI_FEATURE_FOCUS_FRACTION,
     }
 
-    baseline_result = baseline_debugging.run_baseline_debugging(
+    baseline_result_raw = baseline_debugging.run_baseline_debugging(
         model=model,
         fault_type=FAULT_TYPE,
         fault_metadata=fault_metadata,
         injected_splits=injected_splits,
         config=baseline_config,
     )
+    baseline_result = enrich_debugging_result(
+        baseline_result_raw,
+        FAULT_TYPE,
+        fault_metadata,
+    )
     _print_debugging_result("BASELINE DEBUGGING (NO XAI)", baseline_result, FAULT_TYPE)
 
-    xai_result = xai_debugging.run_xai_debugging(
+    xai_result_raw = xai_debugging.run_xai_debugging(
         model=model,
         fault_type=FAULT_TYPE,
         fault_metadata=fault_metadata,
         injected_splits=injected_splits,
         config=xai_config,
     )
+    xai_result = enrich_debugging_result(
+        xai_result_raw,
+        FAULT_TYPE,
+        fault_metadata,
+    )
     _print_debugging_result("XAI DEBUGGING (SHAP)", xai_result, FAULT_TYPE)
 
-    return {
+    oracle_result = run_oracle_repair(
+        model=model,
+        fault_type=FAULT_TYPE,
+        fault_metadata=fault_metadata,
+        injected_splits=injected_splits,
+    )
+    _print_oracle_result(oracle_result)
+
+    output_rows = build_output_rows(
+        seed=RANDOM_STATE,
+        fault_type=FAULT_TYPE,
+        fault_mode=_current_mode_label(),
+        baseline_result=baseline_result,
+        xai_result=xai_result,
+        oracle_result=oracle_result,
+    )
+
+    append_rows_to_csv(output_rows, output_csv)
+
+    full_result = {
+        "seed": RANDOM_STATE,
         "fault_type": FAULT_TYPE,
+        "fault_mode": _current_mode_label(),
         "fault_metadata": fault_metadata,
         "initial_metrics": {
             "train": train_metrics,
@@ -550,13 +1057,46 @@ def main() -> Dict[str, Any]:
         },
         "baseline_debugging_result": baseline_result,
         "xai_debugging_result": xai_result,
+        "oracle_repair_result": oracle_result,
+        "csv_rows": output_rows,
     }
+
+    append_result_to_jsonl(full_result, output_jsonl)
+
+    return full_result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run fault-injection experiment")
-    parser.add_argument("--fault", default=FAULT_TYPE, help="Fault type: none,label_noise,data_leakage,spurious_correlation")
-    parser.add_argument("--mode", type=int, choices=(0, 1), default=0, help="Mode selector: 0 or 1 (mapped per fault)")
+    parser.add_argument(
+        "--fault",
+        default=FAULT_TYPE,
+        help="Fault type: none,label_noise,data_leakage,spurious_correlation",
+    )
+    parser.add_argument(
+        "--mode",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Mode selector: 0 or 1 mapped per fault",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=RANDOM_STATE,
+        help="Random seed for split, injection, and model training",
+    )
+    parser.add_argument(
+        "--output-csv",
+        default=None,
+        help="Optional path to append flat experiment rows, e.g. results/experiments.csv",
+    )
+    parser.add_argument(
+        "--output-jsonl",
+        default=None,
+        help="Optional path to append full nested experiment result, e.g. results/experiments.jsonl",
+    )
+
     args = parser.parse_args()
 
     fault = args.fault
@@ -570,5 +1110,11 @@ if __name__ == "__main__":
         SPURIOUS_MODE = "broken" if mode == 0 else "inverted"
 
     FAULT_TYPE = fault
-    print(f"Running with FAULT_TYPE={FAULT_TYPE}, mode={mode}")
-    main()
+    RANDOM_STATE = int(args.seed)
+
+    print(f"Running with FAULT_TYPE={FAULT_TYPE}, mode={mode}, seed={RANDOM_STATE}")
+
+    run_single_experiment(
+        output_csv=args.output_csv,
+        output_jsonl=args.output_jsonl,
+    )
