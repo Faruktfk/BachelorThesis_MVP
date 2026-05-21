@@ -993,13 +993,11 @@ def _row_from_result(
     for metric_name, value in workflow_result.get("fix_impact", {}).items():
         row[f"delta_{metric_name}"] = value
 
-    suspect_features = workflow_result.get("suspect_features")
-    if suspect_features is not None:
-        row["top5_suspect_features"] = json.dumps(suspect_features[:5], ensure_ascii=False)
+    suspect_features = workflow_result.get("suspect_features") or []
+    suspect_indices = workflow_result.get("suspect_indices") or []
 
-    suspect_indices = workflow_result.get("suspect_indices")
-    if suspect_indices is not None:
-        row["top5_suspect_indices"] = json.dumps(suspect_indices[:5], ensure_ascii=False)
+    row["top5_suspect_features"] = json.dumps(suspect_features[:5], ensure_ascii=False)
+    row["top5_suspect_indices"] = json.dumps(suspect_indices[:5], ensure_ascii=False)
 
     return row
 
