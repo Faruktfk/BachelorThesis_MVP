@@ -3,21 +3,21 @@ row_count,630,630,True,,
 case_workflow_count,30,30,True,none,baseline
 case_workflow_count,30,30,True,none,xai_shap
 case_workflow_count,30,30,True,none,oracle_true_fix
-case_workflow_count,30,30,True,label_noise / random,baseline
-case_workflow_count,30,30,True,label_noise / random,xai_shap
-case_workflow_count,30,30,True,label_noise / random,oracle_true_fix
-case_workflow_count,30,30,True,label_noise / hard,baseline
-case_workflow_count,30,30,True,label_noise / hard,xai_shap
-case_workflow_count,30,30,True,label_noise / hard,oracle_true_fix
-case_workflow_count,30,30,True,data_leakage / direct,baseline
-case_workflow_count,30,30,True,data_leakage / direct,xai_shap
-case_workflow_count,30,30,True,data_leakage / direct,oracle_true_fix
-case_workflow_count,30,30,True,data_leakage / indirect,baseline
-case_workflow_count,30,30,True,data_leakage / indirect,xai_shap
-case_workflow_count,30,30,True,data_leakage / indirect,oracle_true_fix
-case_workflow_count,30,30,True,spurious_correlation / broken,baseline
-case_workflow_count,30,30,True,spurious_correlation / broken,xai_shap
-case_workflow_count,30,30,True,spurious_correlation / broken,oracle_true_fix
-case_workflow_count,30,30,True,spurious_correlation / inverted,baseline
-case_workflow_count,30,30,True,spurious_correlation / inverted,xai_shap
-case_workflow_count,30,30,True,spurious_correlation / inverted,oracle_true_fix
+case_workflow_count,30,30,True,Label Noise / random,baseline
+case_workflow_count,30,30,True,Label Noise / random,xai_shap
+case_workflow_count,30,30,True,Label Noise / random,oracle_true_fix
+case_workflow_count,30,30,True,Label Noise / hard,baseline
+case_workflow_count,30,30,True,Label Noise / hard,xai_shap
+case_workflow_count,30,30,True,Label Noise / hard,oracle_true_fix
+case_workflow_count,30,30,True,Data Leakage / direct,baseline
+case_workflow_count,30,30,True,Data Leakage / direct,xai_shap
+case_workflow_count,30,30,True,Data Leakage / direct,oracle_true_fix
+case_workflow_count,30,30,True,Data Leakage / indirect,baseline
+case_workflow_count,30,30,True,Data Leakage / indirect,xai_shap
+case_workflow_count,30,30,True,Data Leakage / indirect,oracle_true_fix
+case_workflow_count,30,30,True,Spurious Correlation / broken,baseline
+case_workflow_count,30,30,True,Spurious Correlation / broken,xai_shap
+case_workflow_count,30,30,True,Spurious Correlation / broken,oracle_true_fix
+case_workflow_count,30,30,True,Spurious Correlation / inverted,baseline
+case_workflow_count,30,30,True,Spurious Correlation / inverted,xai_shap
+case_workflow_count,30,30,True,Spurious Correlation / inverted,oracle_true_fix

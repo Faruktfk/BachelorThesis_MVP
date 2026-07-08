@@ -1,29 +1,29 @@
 fault_type,fault_mode,workflow,repair_effect_quality,count,case
-data_leakage,direct,baseline,repair_usable,30,data_leakage / direct
-data_leakage,direct,xai_shap,repair_usable,30,data_leakage / direct
-data_leakage,indirect,baseline,repair_too_weak,14,data_leakage / indirect
-data_leakage,indirect,baseline,repair_usable,7,data_leakage / indirect
-data_leakage,indirect,baseline,repair_weak,9,data_leakage / indirect
-data_leakage,indirect,xai_shap,repair_too_weak,14,data_leakage / indirect
-data_leakage,indirect,xai_shap,repair_usable,7,data_leakage / indirect
-data_leakage,indirect,xai_shap,repair_weak,9,data_leakage / indirect
-label_noise,hard,baseline,repair_too_weak,1,label_noise / hard
-label_noise,hard,baseline,repair_usable,29,label_noise / hard
-label_noise,hard,xai_shap,repair_too_weak,1,label_noise / hard
-label_noise,hard,xai_shap,repair_usable,29,label_noise / hard
-label_noise,random,baseline,repair_usable,30,label_noise / random
-label_noise,random,xai_shap,repair_usable,30,label_noise / random
+data_leakage,direct,baseline,repair_usable,30,Data Leakage / direct
+data_leakage,direct,xai_shap,repair_usable,30,Data Leakage / direct
+data_leakage,indirect,baseline,repair_too_weak,14,Data Leakage / indirect
+data_leakage,indirect,baseline,repair_usable,7,Data Leakage / indirect
+data_leakage,indirect,baseline,repair_weak,9,Data Leakage / indirect
+data_leakage,indirect,xai_shap,repair_too_weak,14,Data Leakage / indirect
+data_leakage,indirect,xai_shap,repair_usable,7,Data Leakage / indirect
+data_leakage,indirect,xai_shap,repair_weak,9,Data Leakage / indirect
+label_noise,hard,baseline,repair_too_weak,1,Label Noise / hard
+label_noise,hard,baseline,repair_usable,29,Label Noise / hard
+label_noise,hard,xai_shap,repair_too_weak,1,Label Noise / hard
+label_noise,hard,xai_shap,repair_usable,29,Label Noise / hard
+label_noise,random,baseline,repair_usable,30,Label Noise / random
+label_noise,random,xai_shap,repair_usable,30,Label Noise / random
 none,none,baseline,no_oracle_fix,30,none
 none,none,xai_shap,no_oracle_fix,30,none
-spurious_correlation,broken,baseline,repair_too_weak,15,spurious_correlation / broken
-spurious_correlation,broken,baseline,repair_usable,7,spurious_correlation / broken
-spurious_correlation,broken,baseline,repair_weak,8,spurious_correlation / broken
-spurious_correlation,broken,xai_shap,repair_too_weak,15,spurious_correlation / broken
-spurious_correlation,broken,xai_shap,repair_usable,7,spurious_correlation / broken
-spurious_correlation,broken,xai_shap,repair_weak,8,spurious_correlation / broken
-spurious_correlation,inverted,baseline,repair_too_weak,15,spurious_correlation / inverted
-spurious_correlation,inverted,baseline,repair_usable,7,spurious_correlation / inverted
-spurious_correlation,inverted,baseline,repair_weak,8,spurious_correlation / inverted
-spurious_correlation,inverted,xai_shap,repair_too_weak,15,spurious_correlation / inverted
-spurious_correlation,inverted,xai_shap,repair_usable,7,spurious_correlation / inverted
-spurious_correlation,inverted,xai_shap,repair_weak,8,spurious_correlation / inverted
+spurious_correlation,broken,baseline,repair_too_weak,15,Spurious Correlation / broken
+spurious_correlation,broken,baseline,repair_usable,7,Spurious Correlation / broken
+spurious_correlation,broken,baseline,repair_weak,8,Spurious Correlation / broken
+spurious_correlation,broken,xai_shap,repair_too_weak,15,Spurious Correlation / broken
+spurious_correlation,broken,xai_shap,repair_usable,7,Spurious Correlation / broken
+spurious_correlation,broken,xai_shap,repair_weak,8,Spurious Correlation / broken
+spurious_correlation,inverted,baseline,repair_too_weak,15,Spurious Correlation / inverted
+spurious_correlation,inverted,baseline,repair_usable,7,Spurious Correlation / inverted
+spurious_correlation,inverted,baseline,repair_weak,8,Spurious Correlation / inverted
+spurious_correlation,inverted,xai_shap,repair_too_weak,15,Spurious Correlation / inverted
+spurious_correlation,inverted,xai_shap,repair_usable,7,Spurious Correlation / inverted
+spurious_correlation,inverted,xai_shap,repair_weak,8,Spurious Correlation / inverted
