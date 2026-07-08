@@ -35,7 +35,15 @@ CASE_ORDER = [
 def case_label(fault_type: str, fault_mode: str) -> str:
     if fault_type == "none":
         return "none"
-    return f"{fault_type} / {fault_mode}"
+    
+    pretty_faults = {
+        "label_noise": "Label Noise",
+        "data_leakage": "Data Leakage",
+        "spurious_correlation": "Spurious Correlation",
+    }
+
+    fault = pretty_faults.get(fault_type, fault_type)
+    return f"{fault} / {fault_mode}"
 
 
 def ensure_dir(path: Path) -> None:
@@ -374,13 +382,22 @@ def build_paired_comparisons(df: pd.DataFrame, output_dir: Path) -> pd.DataFrame
         ("hit_at_5", True, "H2: true cause in top 5"),
         ("hit_at_10", True, "H2: true cause in top 10"),
         ("precision_at_k", True, "Label noise: higher top-k precision is better"),
+        ("recall_at_k", True, "Label noise: higher top-k recall is better"),
         ("runtime_sec", False, "Runtime: lower runtime is better"),
+
         ("improvement_clean_holdout_accuracy", True, "H3: larger accuracy improvement is better"),
+        ("improvement_clean_holdout_balanced_accuracy", True, "H3: larger balanced-accuracy improvement is better"),
         ("improvement_clean_holdout_f1", True, "H3: larger F1 improvement is better"),
+        ("improvement_clean_holdout_roc_auc", True, "H3: larger ROC-AUC improvement is better"),
         ("improvement_clean_holdout_log_loss", True, "H3: larger log-loss improvement is better"),
         ("improvement_clean_holdout_brier_score", True, "H3: larger Brier improvement is better"),
+
         ("oracle_normalized_clean_holdout_accuracy", True, "H3: higher oracle-normalized accuracy effect is better"),
+        ("oracle_normalized_clean_holdout_balanced_accuracy", True, "H3: higher oracle-normalized balanced-accuracy effect is better"),
         ("oracle_normalized_clean_holdout_f1", True, "H3: higher oracle-normalized F1 effect is better"),
+        ("oracle_normalized_clean_holdout_roc_auc", True, "H3: higher oracle-normalized ROC-AUC effect is better"),
+        ("oracle_normalized_clean_holdout_log_loss", True, "H3: higher oracle-normalized log-loss effect is better"),
+        ("oracle_normalized_clean_holdout_brier_score", True, "H3: higher oracle-normalized Brier effect is better"),
     ]
 
     rows: list[dict[str, Any]] = []
@@ -575,9 +592,9 @@ def save_hit10_barplot(df: pd.DataFrame, output_path: Path) -> None:
     plt.bar(x + width / 2, xai_values, width, label="XAI SHAP")
 
     plt.xticks(x, cases, rotation=30, ha="right")
-    plt.ylabel("Hit@10 rate")
+    plt.ylabel("Hit@10-Anteil")
     plt.ylim(0, 1.05)
-    plt.title("Hit@10: true injected cause in top 10 candidates")
+    plt.title("Hit@10: wahre Fehlerursache unter den Top-10-Kandidaten")
     plt.legend()
     plt.grid(axis="y", alpha=0.3)
     plt.tight_layout()
@@ -593,7 +610,7 @@ def create_plots(df: pd.DataFrame, plots_dir: Path) -> None:
         df,
         plots_dir / "mrr_boxplot.png",
         "mrr",
-        "MRR by fault class",
+        "Mean Reciprocal Rank nach Fehlerklasse",
         "MRR",
     )
 
@@ -601,16 +618,16 @@ def create_plots(df: pd.DataFrame, plots_dir: Path) -> None:
         df,
         plots_dir / "steps_to_detect_boxplot.png",
         "steps_to_detect",
-        "Steps-to-detect by fault class",
-        "Steps to detect",
+        "Steps-to-detect nach Fehlerklasse",
+        "Steps-to-detect",
     )
 
     save_boxplot(
         df,
         plots_dir / "runtime_boxplot.png",
         "runtime_sec",
-        "Runtime by fault class",
-        "Runtime in seconds",
+        "Laufzeit nach Fehlerklasse",
+        "Laufzeit in Sekunden",
     )
 
     if "precision_at_k" in df.columns:
@@ -620,7 +637,7 @@ def create_plots(df: pd.DataFrame, plots_dir: Path) -> None:
             label_noise_df,
             plots_dir / "label_noise_precision_at_k_boxplot.png",
             "precision_at_k",
-            "Label Noise Precision@k",
+            "Precision@k bei Label Noise",
             "Precision@k",
             include_none=True,
         )
@@ -630,8 +647,8 @@ def create_plots(df: pd.DataFrame, plots_dir: Path) -> None:
             df,
             plots_dir / "clean_holdout_accuracy_improvement_boxplot.png",
             "improvement_clean_holdout_accuracy",
-            "Clean-holdout accuracy improvement",
-            "Accuracy improvement",
+            "Clean-Holdout-Accuracy-Verbesserung nach Fehlerklasse",
+            "Accuracy-Verbesserung",
         )
 
     save_hit10_barplot(df, plots_dir / "hit_at_10_barplot.png")
@@ -647,6 +664,649 @@ def fmt(value: Any) -> str:
         return "n/a"
 
     return f"{number:.4f}"
+
+
+def fmt_de(value: Any, digits: int = 4) -> str:
+    """Format numbers with German decimal comma for thesis tables."""
+    try:
+        number = float(value)
+    except Exception:
+        return "n/a"
+
+    if not np.isfinite(number):
+        return "n/a"
+
+    return f"{number:.{digits}f}".replace(".", ",")
+
+
+def fmt_p_de(value: Any) -> str:
+    """Format p-values in a thesis-friendly way."""
+    try:
+        number = float(value)
+    except Exception:
+        return "n/a"
+
+    if not np.isfinite(number):
+        return "n/a"
+
+    if number < 0.001:
+        return "< 0,001"
+
+    return f"{number:.4f}".replace(".", ",")
+
+
+def thesis_digits_for_column(column: str) -> int:
+    """Choose readable thesis precision per column."""
+    if "Faktor" in column:
+        return 2
+
+    if "Steps" in column:
+        return 2
+
+    if "Laufzeit" in column or "Runtime" in column:
+        return 2
+
+    if "Effektstärke" in column or column.startswith("dz "):
+        return 2
+
+    if "MRR" in column or "Hit@" in column:
+        return 3
+
+    if "Precision" in column or "Recall" in column:
+        return 3
+
+    # Fix-impact values are often small, so keep four decimals.
+    if "Fix-Impact" in column or "Oracle" in column:
+        return 4
+
+    return 3
+
+
+def beautify_repair_quality(value: str) -> str:
+    """Translate internal repair-quality labels for thesis tables."""
+    mapping = {
+        "repair_usable": "reparaturrelevant",
+        "repair_weak": "schwach reparaturrelevant",
+        "repair_too_weak": "zu schwach",
+        "no_oracle_fix": "kein Oracle-Fix",
+        "unknown": "unklar",
+    }
+    return mapping.get(str(value), str(value))
+
+
+def beautify_metric_name(value: str) -> str:
+    """Translate metric suffixes for appendix tables."""
+    mapping = {
+        "accuracy": "Accuracy",
+        "balanced_accuracy": "Balanced Accuracy",
+        "f1": "F1-Score",
+        "roc_auc": "ROC-AUC",
+        "log_loss": "Log-Loss",
+        "brier_score": "Brier-Score",
+    }
+    return mapping.get(str(value), str(value))
+
+
+def format_thesis_table(raw: pd.DataFrame) -> pd.DataFrame:
+    """Apply German labels and readable numeric formatting to a thesis table."""
+    rename_columns = {
+        "Eingesparte Steps durch XAI": "Δ Steps (Baseline - XAI)",
+        "Runtime Baseline (s)": "Laufzeit Baseline (s)",
+        "Runtime XAI (s)": "Laufzeit XAI (s)",
+        "XAI/Baseline-Faktor": "Laufzeitfaktor XAI/Baseline",
+        "dz Steps": "Effektstärke dz (Steps)",
+        "dz MRR": "Effektstärke dz (MRR)",
+        "dz Runtime": "Effektstärke dz (Laufzeit)",
+        "dz Fix-Impact": "Effektstärke dz (Fix-Impact)",
+        "Repair-Quality": "Oracle-Bewertung",
+        "Oracle-normalisiert Baseline": "Oracle-normalisiert Baseline",
+        "Oracle-normalisiert XAI": "Oracle-normalisiert XAI",
+    }
+
+    formatted = raw.rename(columns=rename_columns).copy()
+
+    text_columns = {
+        "Fehlerklasse",
+        "Label-Noise-Modus",
+        "Interpretation",
+        "Oracle-Bewertung",
+        "Metrik",
+    }
+
+    if "Oracle-Bewertung" in formatted.columns:
+        formatted["Oracle-Bewertung"] = formatted["Oracle-Bewertung"].map(beautify_repair_quality)
+
+    if "Metrik" in formatted.columns:
+        formatted["Metrik"] = formatted["Metrik"].map(beautify_metric_name)
+
+    for column in formatted.columns:
+        if column in text_columns:
+            continue
+
+        if column.startswith("p "):
+            formatted[column] = formatted[column].map(fmt_p_de)
+        else:
+            digits = thesis_digits_for_column(column)
+            formatted[column] = formatted[column].map(lambda value: fmt_de(value, digits))
+
+    return formatted
+
+
+def dataframe_to_markdown(table: pd.DataFrame) -> str:
+    """Convert a DataFrame to a simple markdown table without extra dependencies."""
+    columns = list(table.columns)
+
+    lines = []
+    lines.append("| " + " | ".join(columns) + " |")
+    lines.append("| " + " | ".join(["---"] * len(columns)) + " |")
+
+    for _, row in table.iterrows():
+        values = [str(row[column]) for column in columns]
+        lines.append("| " + " | ".join(values) + " |")
+
+    return "\n".join(lines)
+
+
+def comparison_row(comparisons: pd.DataFrame, case: str, metric: str) -> pd.Series | None:
+    rows = comparisons[
+        (comparisons["case"] == case)
+        & (comparisons["metric"] == metric)
+    ]
+
+    if rows.empty:
+        return None
+
+    return rows.iloc[0]
+
+
+def mcnemar_exact_pvalue_for_case(df: pd.DataFrame, case: str, metric: str) -> float:
+    """Exact McNemar-style binomial p-value for paired binary metrics such as Hit@10.
+
+    This is useful because Hit@10 is binary per seed.
+    """
+    if stats is None:
+        return np.nan
+
+    subset = df[
+        (df["case"] == case)
+        & (df["workflow"].isin([BASELINE, XAI]))
+    ]
+
+    if subset.empty or metric not in subset.columns:
+        return np.nan
+
+    pivot = subset.pivot_table(
+        index="seed",
+        columns="workflow",
+        values=metric,
+        aggfunc="first",
+    )
+
+    if BASELINE not in pivot.columns or XAI not in pivot.columns:
+        return np.nan
+
+    paired = pivot[[BASELINE, XAI]].dropna()
+
+    if paired.empty:
+        return np.nan
+
+    baseline = (paired[BASELINE].astype(float) >= 0.5).astype(int)
+    xai = (paired[XAI].astype(float) >= 0.5).astype(int)
+
+    baseline_wrong_xai_right = int(((baseline == 0) & (xai == 1)).sum())
+    baseline_right_xai_wrong = int(((baseline == 1) & (xai == 0)).sum())
+
+    discordant = baseline_wrong_xai_right + baseline_right_xai_wrong
+
+    if discordant == 0:
+        return 1.0
+
+    smaller = min(baseline_wrong_xai_right, baseline_right_xai_wrong)
+
+    try:
+        return float(
+            stats.binomtest(
+                smaller,
+                n=discordant,
+                p=0.5,
+                alternative="two-sided",
+            ).pvalue
+        )
+    except AttributeError:
+        # Fallback for older SciPy versions.
+        p_value = 2.0 * float(stats.binom.cdf(smaller, discordant, 0.5))
+        return min(1.0, p_value)
+
+
+def mode_or_na(series: pd.Series) -> str:
+    values = series.dropna()
+
+    if values.empty:
+        return "n/a"
+
+    mode_values = values.mode()
+
+    if mode_values.empty:
+        return "n/a"
+
+    return str(mode_values.iloc[0])
+
+
+def classify_fix_impact_interpretation(
+    oracle_mean: float,
+    baseline_mean: float,
+    xai_mean: float,
+    p_value: float,
+) -> str:
+    """Generate a conservative interpretation for the H3/Fix-Impact table."""
+    if not np.isfinite(oracle_mean) or abs(oracle_mean) < 0.005:
+        return "Oracle-Potenzial zu schwach"
+
+    delta = xai_mean - baseline_mean
+
+    if np.isfinite(p_value) and p_value < 0.05:
+        if delta > 0:
+            return "XAI höherer Fix-Impact"
+        if delta < 0:
+            return "Baseline höherer Fix-Impact"
+
+    if abs(delta) < 0.005:
+        return "kein klarer Unterschied"
+
+    if delta > 0:
+        return "XAI tendenziell höher"
+
+    return "Baseline tendenziell höher"
+
+
+def build_thesis_localization_table(
+    df: pd.DataFrame,
+    comparisons: pd.DataFrame,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Create thesis-ready localization table for H1/H2."""
+    rows: list[dict[str, Any]] = []
+
+    for fault_type, fault_mode in CASE_ORDER:
+        if fault_type == "none":
+            continue
+
+        case = case_label(fault_type, fault_mode)
+
+        steps = comparison_row(comparisons, case, "steps_to_detect")
+        mrr = comparison_row(comparisons, case, "mrr")
+        hit10 = comparison_row(comparisons, case, "hit_at_10")
+
+        if steps is None or mrr is None or hit10 is None:
+            continue
+
+        hit10_mcnemar_p = mcnemar_exact_pvalue_for_case(df, case, "hit_at_10")
+
+        rows.append(
+            {
+                "Fehlerklasse": case,
+                "Steps Baseline": steps["baseline_mean"],
+                "Steps XAI": steps["xai_mean"],
+                "Eingesparte Steps durch XAI": steps["mean_improvement_by_xai"],
+                "MRR Baseline": mrr["baseline_mean"],
+                "MRR XAI": mrr["xai_mean"],
+                "Hit@10 Baseline": hit10["baseline_mean"],
+                "Hit@10 XAI": hit10["xai_mean"],
+                "p Steps": steps["wilcoxon_p"],
+                "p MRR": mrr["wilcoxon_p"],
+                "p Hit@10": hit10_mcnemar_p,
+                "dz Steps": steps["cohen_dz"],
+                "dz MRR": mrr["cohen_dz"],
+            }
+        )
+
+    raw = pd.DataFrame(rows)
+    raw.to_csv(output_dir / "thesis_table_localization_raw.csv", index=False, encoding="utf-8")
+
+    formatted = format_thesis_table(raw)
+
+    markdown = dataframe_to_markdown(formatted)
+    (output_dir / "thesis_table_localization.md").write_text(markdown, encoding="utf-8")
+
+    return formatted
+
+
+def build_thesis_label_noise_table(
+    comparisons: pd.DataFrame,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Create thesis-ready Precision@k/Recall@k table for Label Noise."""
+    rows: list[dict[str, Any]] = []
+
+    for fault_mode in ["random", "hard"]:
+        case = case_label("label_noise", fault_mode)
+
+        precision = comparison_row(comparisons, case, "precision_at_k")
+        recall = comparison_row(comparisons, case, "recall_at_k")
+
+        if precision is None or recall is None:
+            continue
+
+        precision_delta = float(precision["xai_mean"]) - float(precision["baseline_mean"])
+        recall_delta = float(recall["xai_mean"]) - float(recall["baseline_mean"])
+
+        if precision_delta > 0:
+            interpretation = "XAI besser"
+        elif precision_delta < 0:
+            interpretation = "Baseline besser"
+        else:
+            interpretation = "kein Unterschied"
+
+        rows.append(
+            {
+                "Label-Noise-Modus": fault_mode,
+                "Precision@k Baseline": precision["baseline_mean"],
+                "Precision@k XAI": precision["xai_mean"],
+                "Δ Precision@k (XAI - Baseline)": precision_delta,
+                "Recall@k Baseline": recall["baseline_mean"],
+                "Recall@k XAI": recall["xai_mean"],
+                "Δ Recall@k (XAI - Baseline)": recall_delta,
+                "p Precision@k": precision["wilcoxon_p"],
+                "p Recall@k": recall["wilcoxon_p"],
+                "Interpretation": interpretation,
+            }
+        )
+
+    raw = pd.DataFrame(rows)
+    raw.to_csv(output_dir / "thesis_table_label_noise_topk_raw.csv", index=False, encoding="utf-8")
+
+    formatted = format_thesis_table(raw)
+
+    markdown = dataframe_to_markdown(formatted)
+    (output_dir / "thesis_table_label_noise_topk.md").write_text(markdown, encoding="utf-8")
+
+    return formatted
+
+
+def build_thesis_runtime_table(
+    comparisons: pd.DataFrame,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Create thesis-ready runtime table."""
+    rows: list[dict[str, Any]] = []
+
+    for fault_type, fault_mode in CASE_ORDER:
+        if fault_type == "none":
+            continue
+
+        case = case_label(fault_type, fault_mode)
+        runtime = comparison_row(comparisons, case, "runtime_sec")
+
+        if runtime is None:
+            continue
+
+        baseline_mean = float(runtime["baseline_mean"])
+        xai_mean = float(runtime["xai_mean"])
+
+        if baseline_mean > 1e-12:
+            ratio = xai_mean / baseline_mean
+        else:
+            ratio = np.nan
+
+        if xai_mean > baseline_mean:
+            interpretation = "XAI langsamer"
+        elif xai_mean < baseline_mean:
+            interpretation = "XAI schneller"
+        else:
+            interpretation = "kein Unterschied"
+
+        rows.append(
+            {
+                "Fehlerklasse": case,
+                "Runtime Baseline (s)": baseline_mean,
+                "Runtime XAI (s)": xai_mean,
+                "XAI/Baseline-Faktor": ratio,
+                "p Runtime": runtime["wilcoxon_p"],
+                "dz Runtime": runtime["cohen_dz"],
+                "Interpretation": interpretation,
+            }
+        )
+
+    raw = pd.DataFrame(rows)
+    raw.to_csv(output_dir / "thesis_table_runtime_raw.csv", index=False, encoding="utf-8")
+
+    formatted = format_thesis_table(raw)
+
+    markdown = dataframe_to_markdown(formatted)
+    (output_dir / "thesis_table_runtime.md").write_text(markdown, encoding="utf-8")
+
+    return formatted
+
+
+def build_thesis_fix_impact_table(
+    df: pd.DataFrame,
+    comparisons: pd.DataFrame,
+    output_dir: Path,
+    metric_suffix: str = "accuracy",
+) -> pd.DataFrame:
+    """Create compact thesis-ready H3/Fix-Impact table for one primary metric.
+
+    Default metric:
+    - clean_holdout_accuracy
+
+    Positive values always mean improvement because add_derived_columns()
+    converts lower-is-better metrics such as log_loss and brier_score.
+    """
+    metric = f"improvement_clean_holdout_{metric_suffix}"
+    normalized_metric = f"oracle_normalized_clean_holdout_{metric_suffix}"
+
+    if metric not in df.columns:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+
+    for fault_type, fault_mode in CASE_ORDER:
+        if fault_type == "none":
+            continue
+
+        case = case_label(fault_type, fault_mode)
+        case_df = df[df["case"] == case]
+
+        if case_df.empty:
+            continue
+
+        baseline_rows = case_df[case_df["workflow"] == BASELINE]
+        xai_rows = case_df[case_df["workflow"] == XAI]
+        oracle_rows = case_df[case_df["workflow"] == ORACLE]
+
+        if baseline_rows.empty or xai_rows.empty or oracle_rows.empty:
+            continue
+
+        baseline_mean = float(baseline_rows[metric].mean())
+        xai_mean = float(xai_rows[metric].mean())
+        oracle_mean = float(oracle_rows[metric].mean())
+
+        baseline_norm = (
+            float(baseline_rows[normalized_metric].mean())
+            if normalized_metric in baseline_rows.columns
+            else np.nan
+        )
+
+        xai_norm = (
+            float(xai_rows[normalized_metric].mean())
+            if normalized_metric in xai_rows.columns
+            else np.nan
+        )
+
+        comp = comparison_row(comparisons, case, metric)
+
+        if comp is not None:
+            p_value = float(comp["wilcoxon_p"])
+            cohen_dz = float(comp["cohen_dz"])
+        else:
+            p_value = np.nan
+            cohen_dz = np.nan
+
+        repair_quality = mode_or_na(baseline_rows["repair_effect_quality"])
+
+        interpretation = classify_fix_impact_interpretation(
+            oracle_mean=oracle_mean,
+            baseline_mean=baseline_mean,
+            xai_mean=xai_mean,
+            p_value=p_value,
+        )
+
+        rows.append(
+            {
+                "Fehlerklasse": case,
+                "Oracle-Potenzial": oracle_mean,
+                "Fix-Impact Baseline": baseline_mean,
+                "Fix-Impact XAI": xai_mean,
+                "Δ Fix-Impact (XAI - Baseline)": xai_mean - baseline_mean,
+                "Oracle-normalisiert Baseline": baseline_norm,
+                "Oracle-normalisiert XAI": xai_norm,
+                "Repair-Quality": repair_quality,
+                "p Fix-Impact": p_value,
+                "dz Fix-Impact": cohen_dz,
+                "Interpretation": interpretation,
+            }
+        )
+
+    raw = pd.DataFrame(rows)
+    raw.to_csv(
+        output_dir / f"thesis_table_h3_fix_impact_{metric_suffix}_raw.csv",
+        index=False,
+        encoding="utf-8",
+    )
+
+    formatted = format_thesis_table(raw)
+
+    markdown = dataframe_to_markdown(formatted)
+    (output_dir / f"thesis_table_h3_fix_impact_{metric_suffix}.md").write_text(
+        markdown,
+        encoding="utf-8",
+    )
+
+    return formatted
+
+
+def build_thesis_fix_impact_long_table(
+    df: pd.DataFrame,
+    comparisons: pd.DataFrame,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Create a longer appendix-style H3 table across multiple clean-holdout metrics."""
+    metric_suffixes = [
+        "accuracy",
+        "balanced_accuracy",
+        "f1",
+        "roc_auc",
+        "log_loss",
+        "brier_score",
+    ]
+
+    rows: list[dict[str, Any]] = []
+
+    for fault_type, fault_mode in CASE_ORDER:
+        if fault_type == "none":
+            continue
+
+        case = case_label(fault_type, fault_mode)
+        case_df = df[df["case"] == case]
+
+        if case_df.empty:
+            continue
+
+        for metric_suffix in metric_suffixes:
+            metric = f"improvement_clean_holdout_{metric_suffix}"
+            normalized_metric = f"oracle_normalized_clean_holdout_{metric_suffix}"
+
+            if metric not in df.columns:
+                continue
+
+            baseline_rows = case_df[case_df["workflow"] == BASELINE]
+            xai_rows = case_df[case_df["workflow"] == XAI]
+            oracle_rows = case_df[case_df["workflow"] == ORACLE]
+
+            baseline_mean = float(baseline_rows[metric].mean())
+            xai_mean = float(xai_rows[metric].mean())
+            oracle_mean = float(oracle_rows[metric].mean())
+
+            baseline_norm = (
+                float(baseline_rows[normalized_metric].mean())
+                if normalized_metric in baseline_rows.columns
+                else np.nan
+            )
+
+            xai_norm = (
+                float(xai_rows[normalized_metric].mean())
+                if normalized_metric in xai_rows.columns
+                else np.nan
+            )
+
+            comp = comparison_row(comparisons, case, metric)
+
+            rows.append(
+                {
+                    "Fehlerklasse": case,
+                    "Metrik": metric_suffix,
+                    "Oracle-Potenzial": oracle_mean,
+                    "Fix-Impact Baseline": baseline_mean,
+                    "Fix-Impact XAI": xai_mean,
+                    "Δ Fix-Impact (XAI - Baseline)": xai_mean - baseline_mean,
+                    "Oracle-normalisiert Baseline": baseline_norm,
+                    "Oracle-normalisiert XAI": xai_norm,
+                    "p Fix-Impact": float(comp["wilcoxon_p"]) if comp is not None else np.nan,
+                    "dz Fix-Impact": float(comp["cohen_dz"]) if comp is not None else np.nan,
+                }
+            )
+
+    raw = pd.DataFrame(rows)
+    raw.to_csv(output_dir / "thesis_table_h3_fix_impact_long_raw.csv", index=False, encoding="utf-8")
+
+    formatted = format_thesis_table(raw)
+
+    markdown = dataframe_to_markdown(formatted)
+    (output_dir / "thesis_table_h3_fix_impact_long.md").write_text(markdown, encoding="utf-8")
+
+    return formatted
+
+
+def create_thesis_ready_tables(
+    df: pd.DataFrame,
+    comparisons: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    """Create all thesis-ready tables from the experiment data."""
+    localization = build_thesis_localization_table(df, comparisons, output_dir)
+    label_noise = build_thesis_label_noise_table(comparisons, output_dir)
+    runtime = build_thesis_runtime_table(comparisons, output_dir)
+    fix_impact_accuracy = build_thesis_fix_impact_table(
+        df,
+        comparisons,
+        output_dir,
+        metric_suffix="accuracy",
+    )
+    fix_impact_long = build_thesis_fix_impact_long_table(df, comparisons, output_dir)
+
+    sections: list[tuple[str, pd.DataFrame]] = [
+        ("## Tabelle: Lokalisierungsergebnisse für H1/H2", localization),
+        ("## Tabelle: Precision@k und Recall@k bei Label Noise", label_noise),
+        ("## Tabelle: Laufzeitvergleich", runtime),
+        ("## Tabelle: Fix-Impact für H3 anhand Clean-Holdout Accuracy", fix_impact_accuracy),
+        ("## Anhangstabelle: Fix-Impact über alle Clean-Holdout-Metriken", fix_impact_long),
+    ]
+
+    lines: list[str] = ["# Thesis-ready Tabellen", ""]
+
+    for title, table in sections:
+        if table.empty:
+            continue
+
+        lines.append(title)
+        lines.append("")
+        lines.append(dataframe_to_markdown(table))
+        lines.append("")
+
+    (output_dir / "thesis_ready_tables.md").write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
 
 
 def write_markdown_report(
@@ -735,7 +1395,7 @@ def main() -> None:
 
     parser.add_argument(
         "--input",
-        default="results/itr_7/experiments.csv",
+        default="results/itr_1/experiments.csv",
         help="Path to experiments.csv",
     )
 
@@ -770,6 +1430,7 @@ def main() -> None:
     aggregate_workflow_summary(df, output_dir)
     comparisons = build_paired_comparisons(df, output_dir)
     create_repair_quality_counts(df, output_dir)
+    create_thesis_ready_tables(df, comparisons, output_dir)
     create_plots(df, plots_dir)
     write_markdown_report(df, validation, comparisons, output_dir)
 

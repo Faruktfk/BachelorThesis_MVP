@@ -7,10 +7,10 @@
 #   ./run0_experiments.sh
 #
 # Custom:
-#   ./run0_experiments.sh itr_7 0 29
+#   ./run0_experiments.sh itr_2 0 29
 #
 # Arguments:
-#   $1 = iteration name / result folder name, default: itr_7
+#   $1 = iteration name / result folder name, default: itr_2
 #   $2 = first seed, default: 0
 #   $3 = last seed, default: 29
 #
@@ -27,7 +27,7 @@ set -uo pipefail
 # -----------------------------
 # User-configurable parameters
 # -----------------------------
-ITERATION_NAME="${1:-itr_7}"
+ITERATION_NAME="${1:-itr_2}"
 SEED_START="${2:-0}"
 SEED_END="${3:-29}"
 
@@ -312,7 +312,5 @@ fi
 
 
 python analyze_results.py --input results/${ITERATION_NAME}/experiments.csv --outdir results/${ITERATION_NAME}/analysis
-
-python analyze_results.py --input results/itr_7/experiments.csv --outdir results/itr_8/analysis
 
 exit 0

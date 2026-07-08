@@ -7,7 +7,7 @@
 #   ./make_code_log.sh
 #
 # Custom:
-#   ./make_code_log.sh itr_7
+#   ./make_code_log.sh itr_2
 #
 # Output:
 #   results/<iteration>/code_log_<iteration>.txt
@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-ITERATION_NAME="${1:-itr_7}"
+ITERATION_NAME="${1:-itr_2}"
 RESULT_DIR="results/${ITERATION_NAME}"
 
 LOG_FILE="${RESULT_DIR}/log.md"
